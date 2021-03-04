@@ -10,7 +10,10 @@ MODULE_LICENSE("GPL");
 static int my_proc_init(void)
 {
 	struct task_struct *p = current;
-	pr_info("PID = %d; Name = %s", p->pid, p->comm);
+
+	pr_info("Current process: PID = %d; Name = %s", p->pid, p->comm);
+	for_each_process(p)
+		pr_info("PID = %d; Name = %s", p->pid, p->comm);
 
 	return 0;
 }

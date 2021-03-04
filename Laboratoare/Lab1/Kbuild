@@ -8,3 +8,4 @@ obj-m += ./kernel_modules/4-multi-mod/
 obj-m += ./kernel_modules/7-list-proc/
 obj-m += ./kernel_modules/5-oops-mod/
 obj-m += ./kernel_modules/6-cmd-mod/
+obj-m += ./kernel_modules/10-mem-info/
