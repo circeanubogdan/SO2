@@ -143,19 +143,14 @@ static void task_info_purge_list(void)
 	struct task_info *ti;
 
 	/* TODO 1: Protect list, is this read or write access? */
-	read_lock(&lock);
+	write_lock(&lock);
 	list_for_each_safe(p, q, &head) {
 		ti = list_entry(p, struct task_info, list);
-		read_unlock(&lock);
-		write_lock(&lock);
 		list_del(p);
-		write_unlock(&lock);
-
 		kfree(ti);
-		read_lock(&lock);
 	}
 	/* TODO 1: Critical sections ends here */
-	read_unlock(&lock);
+	write_unlock(&lock);
 }
 
 static int list_sync_init(void)
