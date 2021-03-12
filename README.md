@@ -13,3 +13,7 @@ Se aplica urmatoarele concepte in dezvoltarea modulelor de kernel:
 - alocarea si eliberarea memoriei
 - utilizarea listelor din Kernel
 - utilizarea unor primitive de sincroniozare (`spinlock_t` si `rwlock_t`)
+
+### Lab 3 - Driver dispozitiv caracter
+Se implementeaza un driver pentru un dispozitiv de tip caracter,
+respectiv apelurile `open`, `read`, `write`, `close` si `ioctl`.
