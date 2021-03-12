@@ -3,6 +3,11 @@ Sisteme de Operare 2 - UPB 2021:
 https://linux-kernel-labs.github.io/refs/heads/master/
 
 
+## `c_cpp_properties.json`
+Fisierul contine setarile pentru *VS Code* cu care *intelliSense* functioneaza
+(destul de) corect.
+
+
 ## Laboratoare
 ### Lab1 - Module de kernel
 Introducere in infrastructura de laborator si in dezvoltarea de module de

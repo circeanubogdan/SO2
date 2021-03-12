@@ -1,0 +1,27 @@
+{
+	"configurations": [
+		{
+		"name": "Linux",
+		"includePath": [
+			"${workspaceFolder}/**",
+			"/home/teo/linux/include/**",
+			"/home/teo/linux/arch/x86/include/**",
+			"/usr/lib/gcc/x86_64-linux-gnu/9/include/**"
+		],
+		"defines": [
+			"__KERNEL__",
+			"MODULE"
+		],
+		"compilerArgs": [
+			"-nostdinc",
+			"-include", "/home/teo/linux/include/linux/kconfig.h",
+			"-include", "/home/teo/linux/include/compiler_types.h"
+		],
+		"compilerPath": "/usr/bin/gcc",
+		"cStandard": "c11",
+		"cppStandard": "c++14",
+		"intelliSenseMode": "gcc-x64"
+		}
+	],
+	"version": 4
+}
