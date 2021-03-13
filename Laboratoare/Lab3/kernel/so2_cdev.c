@@ -38,6 +38,7 @@ struct so2_device_data {
 	/* TODO 4: add buffer with BUFSIZ elements */
 	unsigned char buf[BUFSIZ];
 	/* TODO 7: extra members for home */
+	wait_queue_head_t wq;
 	/* TODO 3: add atomic_t access variable to keep track if file is opened */
 	atomic_t opened;
 };
@@ -50,7 +51,7 @@ static int so2_cdev_open(struct inode *inode, struct file *file)
 		container_of(inode->i_cdev, struct so2_device_data, cdev);
 
 	/* TODO 2: print message when the device file is open. */
-	pr_info("Opening manele file %s.", file->f_path.dentry->d_name.name);
+	pr_info("Opening manele file %s\n", file->f_path.dentry->d_name.name);
 
 	/**
 	 * TODO 3: inode->i_cdev contains our cdev struct, use container_of to
@@ -59,8 +60,8 @@ static int so2_cdev_open(struct inode *inode, struct file *file)
 	file->private_data = data;
 
 	/* TODO 3: return immediately if access is != 0, use atomic_cmpxchg */
-	if (atomic_cmpxchg(&data->opened, 0, 1))
-		return -EBUSY;
+	// if (atomic_cmpxchg(&data->opened, 0, 1))
+	// 	return -EBUSY;
 
 	set_current_state(TASK_INTERRUPTIBLE);
 	schedule_timeout(1000);
@@ -76,7 +77,7 @@ so2_cdev_release(struct inode *inode, struct file *file)
 		(struct so2_device_data *)file->private_data;
 #endif
 	/* TODO 2: print message when the device file is closed. */
-	pr_info("Releasing manele file %s.", file->f_path.dentry->d_name.name);
+	pr_info("Releasing manele file %s\n", file->f_path.dentry->d_name.name);
 
 #ifndef EXTRA
 	/* TODO 3: reset access variable to 0, use atomic_set */
@@ -95,11 +96,13 @@ so2_cdev_read(struct file *file,
 	ssize_t to_read = min(size, BUFSIZ - *offset);
 	if (to_read <= 0)
 		return 0;
-
 #ifdef EXTRA
 	/* TODO 7: extra tasks for home */
+	if (file->f_flags & O_NONBLOCK)
+		return -EWOULDBLOCK;
+	else
+		wait_event(data->wq, data->opened.counter);
 #endif
-
 	/* TODO 4: Copy data->buffer to user_buffer, use copy_to_user */
 	if (copy_to_user(user_buffer, data->buf + *offset, to_read))
 		return -EFAULT;
@@ -123,7 +126,10 @@ so2_cdev_write(struct file *file,
 	/* TODO 5: copy user_buffer to data->buffer, use copy_from_user */
 	if (copy_from_user(data->buf + *offset, user_buffer, to_write))
 		return -EFAULT;
+
 	/* TODO 7: extra tasks for home */
+	atomic_set(&data->opened, 1);
+	wake_up(&data->wq);
 
 	*offset += to_write;
 
@@ -135,15 +141,29 @@ so2_cdev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct so2_device_data *data =
 		(struct so2_device_data *)file->private_data;
-	int ret = 0;
+	ssize_t ret = 0;
 	int remains;
+	loff_t offset = 0;
 
 	switch (cmd) {
 	/* TODO 6: if cmd = MY_IOCTL_PRINT, display IOCTL_MESSAGE */
 	case MY_IOCTL_PRINT:
-		pr_info("ioctl says: %s", IOCTL_MESSAGE);
+		pr_info("ioctl says: %s\n", IOCTL_MESSAGE);
 		break;
 	/* TODO 7: extra tasks, for home */
+	case MY_IOCTL_SET_BUFFER:
+		ret = so2_cdev_write(file, (char *)arg, BUFFER_SIZE, &offset);
+		break;
+	case MY_IOCTL_GET_BUFFER:
+		ret = so2_cdev_read(file, (char *)arg, BUFFER_SIZE, &offset);
+		break;
+	case MY_IOCTL_DOWN:
+		wait_event(data->wq, data->opened.counter);
+		break;
+	case MY_IOCTL_UP:
+		atomic_set(&data->opened, 1);
+		wake_up(&data->wq);
+		break;
 	default:
 		ret = -EINVAL;
 	}
@@ -179,16 +199,16 @@ static int so2_cdev_init(void)
 	);
 	if (err)
 		return err;
-	pr_info("Manele driver is registered.");
+
+	pr_info("Manele driver is registered\n");
 
 	for (i = 0; i < NUM_MINORS; i++) {
 #ifdef EXTRA
 		/* TODO 7: extra tasks, for home */
-#else
+		init_waitqueue_head(&devs[i].wq);
+#endif
 		/*TODO 4: initialize buffer with MESSAGE string */
 		strcpy(devs[i].buf, MESSAGE);
-#endif
-		/* TODO 7: extra tasks for home */
 		/* TODO 3: set access variable to 0, use atomic_set */
 		atomic_set(&devs[i].opened, 0);
 		/* TODO 2: init and add cdev to kernel core */
@@ -215,7 +235,7 @@ static void so2_cdev_exit(void)
 	 * starting at MY_MINOR
 	 */
 	unregister_chrdev_region(MKDEV(MY_MAJOR, MY_MINOR), NUM_MINORS);
-	pr_info("No more manele driver... :(");
+	pr_info("No more manele driver... :(\n");
 }
 
 module_init(so2_cdev_init);
