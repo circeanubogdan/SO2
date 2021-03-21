@@ -89,16 +89,16 @@ static struct string_node *create_node(char *new_str)
 	return new_node;
 }
 
-static void add(char *new_str, enum which_node which)
+static int add(char *new_str, enum which_node which)
 {
 	struct string_node *new_node;
 
 	if (which == ALL)
-		return;
+		return 0;
 
 	new_node = create_node(new_str);
 	if (!new_node)
-		return;
+		return -ENOMEM;
 
 	write_lock(&lock);
 	if (which == FIRST)
@@ -106,6 +106,8 @@ static void add(char *new_str, enum which_node which)
 	else
 		list_add(&new_node->node, head.prev);
 	write_unlock(&lock);
+
+	return 0;
 }
 
 static void del(char *new_str, enum which_node which)
@@ -150,6 +152,7 @@ static ssize_t list_write(struct file *file, const char __user *buffer,
 {
 	char local_buffer[PROCFS_MAX_SIZE + 1];  /* extra byte for \0 */
 	unsigned long local_buffer_size = 0;
+	int ret = 0;
 
 	local_buffer_size = count;
 	if (local_buffer_size > PROCFS_MAX_SIZE)
@@ -161,13 +164,16 @@ static ssize_t list_write(struct file *file, const char __user *buffer,
 
 	/* local_buffer contains the command written in /proc/list/management */
 	if (!memcmp(local_buffer, ADD_FIRST, sizeof(ADD_FIRST) - 1))
-		add(local_buffer + sizeof(ADD_FIRST), FIRST);
+		ret = add(local_buffer + sizeof(ADD_FIRST), FIRST);
 	else if (!memcmp(local_buffer, ADD_END, sizeof(ADD_END) - 1))
-		add(local_buffer + sizeof(ADD_END), LAST);
+		ret = add(local_buffer + sizeof(ADD_END), LAST);
 	else if (!memcmp(local_buffer, DEL_FIRST, sizeof(DEL_FIRST) - 1))
 		del(local_buffer + sizeof(DEL_FIRST), FIRST);
 	else if (!memcmp(local_buffer, DEL_ALL, sizeof(DEL_ALL) - 1))
 		del(local_buffer + sizeof(DEL_ALL), ALL);
+
+	if (ret)
+		return ret;
 
 	return local_buffer_size;
 }
