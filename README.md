@@ -28,6 +28,15 @@ Se implementeaza un driver pentru un dispozitiv de tip caracter,
 respectiv apelurile `open`, `read`, `write`, `close` si `ioctl`.
 
 
+### Lab 4 - Intreruperi
+Se implementeaza un keylogger care retine tastele apaste intr-un buffer. La
+fieca apasare, se declanseaza o intrerupere al carei handler salveaza tasta. Se
+foloseste registrul de date controllerului **i8042**, in care sunt scrise coduri
+care indica tastele apasate.
+
+Continutul bufferului poate fi citit sau sters accesand fisierul `/dev/kbd`.
+
+
 
 ## Teme
 ### Tema 0 - API-ul de liste din Kernel
