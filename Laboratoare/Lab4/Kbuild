@@ -1,3 +1,4 @@
 ccflags-y = -Wno-unused-function -Wno-unused-label -Wno-unused-variable
 
-obj-m = kbd.o
+obj-m += kbd.o
+obj-m += kbd_kfifo.o
