@@ -8,14 +8,19 @@
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/module.h>
+#include <linux/types.h>
+#include <linux/hashtable.h>
 #include <linux/kprobes.h>
 #include <linux/sched.h>
 #include <linux/miscdevice.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
+#include <linux/slab.h>
+#include <linux/rcupdate.h>
 
 #include "tracer.h"
 
+#define HT_BITS				10
 #define PROC_TRACER			"tracer"
 #define MAX_ACTIVE			32
 #define KMALLOC_FUNC			"__kmalloc"
@@ -26,63 +31,180 @@
 #define UP_FUNC				"up"
 #define DOWN_INTR_FUNC			"down_interruptible"
 
+#define HANDLE_SIMPLE_FUNC(field)					\
+	do {								\
+		struct proc_info *pi = get_node(current->pid);		\
+		if (!pi)						\
+			return -EINVAL;					\
+		++pi->field;						\
+		return 0;						\
+	} while (0)
+
+
+struct proc_info {
+	pid_t pid;
+	uint num_kmalloc;
+	uint num_kfree;
+	uint num_sched;
+	uint num_up;
+	uint num_down;
+	uint num_lock;
+	uint num_unlock;
+	size_t kmalloc_mem;
+	size_t kfree_mem;
+	DECLARE_HASHTABLE(mem, HT_BITS);
+	struct hlist_node node;
+};
+
+struct addr_info {
+	size_t addr;
+	size_t size;
+	struct hlist_node node;
+};
+
+
+static DEFINE_HASHTABLE(procs, HT_BITS);
+static DEFINE_SPINLOCK(lock);
+
+
+static struct proc_info *get_node(pid_t pid)
+{
+	struct proc_info *pi;
+
+	rcu_read_lock();
+	hash_for_each_possible_rcu_notrace(procs, pi, node, pid)
+		if (pi->pid == pid) {
+			rcu_read_unlock();
+			return pi;
+		}
+	rcu_read_unlock();
+
+	return NULL;
+}
+
 
 static int
 kmalloc_entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	// pr_info("Handling KMALLOC\n");
+	*(size_t *)ri->data = regs->ax;
 	return 0;
 }
 
-static int kmalloc_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
+static struct addr_info *create_addr_node(size_t addr, size_t size)
 {
-	// pr_info("Handling KMALLOC\n");
+	struct addr_info *node = kcalloc(1, sizeof(*node), GFP_ATOMIC);
+	if (!node) {
+		pr_err("kcalloc addr_info failed\n");
+		return NULL;
+	}
+
+	node->addr = addr;
+	node->size = size;
+
+	return node;
+}
+
+static int
+kmalloc_exit_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	struct addr_info *ai;
+	size_t size = *(size_t *)ri->data;
+	size_t addr = regs_return_value(regs);
+	struct proc_info *pi = get_node(current->pid);
+
+	if (!pi)
+		return -EINVAL;
+
+	ai = create_addr_node(addr, size);
+	if (!ai)
+		return -EINVAL;
+	
+	hash_add(pi->mem, &ai->node, addr);
+	++pi->num_kmalloc;
+	pi->kmalloc_mem += size;
+
 	return 0;
 }
 
 static int kfree_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	// pr_info("Handling KFREE\n");
-	return 0;
+	struct addr_info *ai;
+	struct hlist_node *tmp;
+	size_t addr = regs->ax;
+	struct proc_info *pi = get_node(current->pid);
+
+	if (!pi)
+		return -EINVAL;
+
+	hash_for_each_possible_safe(pi->mem, ai, tmp, node, addr)
+		if (addr == ai->addr) {
+			++pi->num_kfree;
+			pi->kfree_mem += ai->size;
+
+			return 0;
+		}	
+
+	return -EINVAL;
 }
 
 static int schedule_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	// pr_info("Handling SCHEDULE\n");
-	return 0;
+	HANDLE_SIMPLE_FUNC(num_sched);
 }
 
 static int
 mutex_lock_nested_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	// pr_info("Handling LOCK\n");
-	return 0;
+	HANDLE_SIMPLE_FUNC(num_lock);
 }
 
 static int
 mutex_unlock_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	// pr_info("Handling UNLOCK\n");
-	return 0;
+	HANDLE_SIMPLE_FUNC(num_unlock);
 }
 
 static int up_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	// pr_info("Handling UP\n");
-	return 0;
+	HANDLE_SIMPLE_FUNC(num_up);
 }
 
 static int
 down_intr_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	// pr_info("Handling DOWN\n");
-	return 0;
+	HANDLE_SIMPLE_FUNC(num_down);
 }
 
 
 static int tracer_print(struct seq_file *m, void *v)
 {
-	// TODO: implementeaza si spera ca seq_print sa nu aloce memorie
+	struct proc_info *pi;
+	size_t i;
+
+	seq_puts(
+		m,
+		"PID\tkmalloc\tkfree\tkmalloc_mem\tkfree_mem\tsched\tup\tdown\t"
+			"lock\tunlock\n"
+	);
+
+	rcu_read_lock();
+	hash_for_each_rcu(procs, i, pi, node)
+		seq_printf(
+			m,
+			"%d\t%u\t%u\t%zu\t%zu\t%u\t%u\t%u\t%u\t%u\n",
+			pi->pid,
+			pi->num_kmalloc,
+			pi->num_kfree,
+			pi->kmalloc_mem,
+			pi->kfree_mem,
+			pi->num_sched,
+			pi->num_up,
+			pi->num_down,
+			pi->num_lock,
+			pi->num_unlock
+		);
+	rcu_read_unlock();
+
 	return 0;
 }
 
@@ -102,16 +224,51 @@ static int tracer_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
+static struct proc_info *create_proc_node(pid_t pid)
+{
+	struct proc_info *pi = kcalloc(1, sizeof(*pi), GFP_KERNEL);
+	if (!pi) {
+		pr_err("Failed to allocate memory for proc_info\n");
+		return NULL;
+	}
+
+	hash_init(pi->mem);
+	pi->pid = pid;
+
+	return pi;
+}
+
 static long tracer_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-	// TODO: baga IOCTL
+	struct proc_info *pi;
+
 	switch (cmd)
 	{
 	case TRACER_ADD_PROCESS:
-		pr_info("Cica adaug process... kek :)))\n");
+		pi = create_proc_node(arg);
+		if (!pi)
+			return -ENOMEM;
+
+		spin_lock(&lock);
+		hash_add_rcu(procs, &pi->node, arg);
+		spin_unlock(&lock);
+
 		break;
+
 	case TRACER_REMOVE_PROCESS:
-		pr_info("Cica scot proces\n");
+		pi = get_node(arg);
+		if (!pi) {
+			pr_err("PID %ld not found\n", arg);
+			return -EINVAL;
+		}
+
+		spin_lock(&lock);
+		hash_del_rcu(&pi->node);
+		spin_unlock(&lock);
+		synchronize_rcu();
+		kfree(pi);
+		// TODO: free(hashtable intern)
+
 		break;
 	default:
 		pr_err("Undefined IOCTL command\n");
@@ -145,21 +302,11 @@ static struct miscdevice tracer_dev = {
 };
 
 
-/* The positions of each probe in the probes array */
-enum which_probe {
-	KMALLOC = 0,
-	KFREE,
-	SCHEDULE,
-	MUTEX_LOCK_NESTED,
-	MUTEX_UNLOCK,
-	UP,
-	DOWN_INTR
-};
-
-static struct kretprobe probes[] = {
+static struct kretprobe kprobes[] = {
 	{
 		.entry_handler = kmalloc_entry_handler,
-		.handler = kmalloc_handler,
+		.handler = kmalloc_exit_handler,
+		.data_size = sizeof(size_t),
 		.maxactive = MAX_ACTIVE,
 		.kp.symbol_name = KMALLOC_FUNC
 	},
@@ -200,20 +347,20 @@ static void unregister_probes(size_t pos)
 {
 	size_t i;
 	for (i = 0; i != pos; ++i)
-		unregister_kretprobe(probes + i);
+		unregister_kretprobe(kprobes + i);
 }
 
 static int __init kretprobe_init(void)
 {
 	int ret;
-	size_t i, num_probes = sizeof(probes) / sizeof(*probes);
+	size_t i, num_probes = sizeof(kprobes) / sizeof(*kprobes);
 
 	for (i = 0; i != num_probes; ++i) {
-		ret = register_kretprobe(probes + i);
+		ret = register_kretprobe(kprobes + i);
 		if (ret) {
 			pr_err(
 				"Failed to register probe for function %s\n",
-				probes[i].kp.symbol_name
+				kprobes[i].kp.symbol_name
 			);
 			goto err_unregister;
 		}
@@ -240,11 +387,30 @@ err_unregister:
 	return ret;
 }
 
+static void free_hash_tables(void)
+{
+	size_t i, j;
+	struct proc_info *pi;
+	struct proc_info *ai;
+	struct hlist_node *tmp_procs, *tmp_addr;
+
+	hash_for_each_safe(procs, i, tmp_procs, pi, node) {
+		hash_for_each_safe(pi->mem, j, tmp_addr, ai, node) {
+			hash_del(tmp_addr);
+			kfree(ai);
+		}
+
+		hash_del(tmp_procs);
+		kfree(pi);
+	}
+}
+
 static void __exit kretprobe_exit(void)
 {
 	misc_deregister(&tracer_dev);
 	proc_remove(tracer_read);
-	unregister_probes(sizeof(probes) / sizeof(*probes) + 1);
+	unregister_probes(sizeof(kprobes) / sizeof(*kprobes) + 1);
+	free_hash_tables();
 }
 
 
