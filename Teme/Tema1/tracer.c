@@ -31,13 +31,24 @@
 #define UP_FUNC				"up"
 #define DOWN_INTR_FUNC			"down_interruptible"
 
-#define HANDLE_SIMPLE_FUNC(field)					\
+#define HANDLE_SIMPLE_FUNC(field, ret)					\
 	do {								\
 		struct proc_info *pi = get_node(current->pid);		\
-		if (!pi)						\
-			return -EINVAL;					\
+		if (!pi) {						\
+			ret = -EINVAL;					\
+			break;						\
+		}							\
 		++pi->field;						\
-		return 0;						\
+		ret = 0;						\
+	} while (0)
+
+#define hash_free(ht, idx, tmp, ptr, extra)				\
+	do {								\
+		hash_for_each_safe(ht, idx, tmp, ptr, node) {		\
+			extra;						\
+			hash_del(&ptr->node);				\
+			kfree(ptr);					\
+		}							\
 	} while (0)
 
 
@@ -52,7 +63,7 @@ struct proc_info {
 	uint num_unlock;
 	size_t kmalloc_mem;
 	size_t kfree_mem;
-	DECLARE_HASHTABLE(mem, HT_BITS);
+	DECLARE_HASHTABLE(mem, 3);
 	struct hlist_node node;
 };
 
@@ -93,10 +104,9 @@ kmalloc_entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 static struct addr_info *create_addr_node(size_t addr, size_t size)
 {
 	struct addr_info *node = kcalloc(1, sizeof(*node), GFP_ATOMIC);
-	if (!node) {
-		pr_err("kcalloc addr_info failed\n");
+
+	if (!node)
 		return NULL;
-	}
 
 	node->addr = addr;
 	node->size = size;
@@ -118,7 +128,7 @@ kmalloc_exit_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 	ai = create_addr_node(addr, size);
 	if (!ai)
 		return -EINVAL;
-	
+
 	hash_add(pi->mem, &ai->node, addr);
 	++pi->num_kmalloc;
 	pi->kmalloc_mem += size;
@@ -142,37 +152,52 @@ static int kfree_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 			pi->kfree_mem += ai->size;
 
 			return 0;
-		}	
+		}
 
 	return -EINVAL;
 }
 
 static int schedule_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	HANDLE_SIMPLE_FUNC(num_sched);
+	int ret;
+
+	HANDLE_SIMPLE_FUNC(num_sched, ret);
+	return ret;
 }
 
 static int
 mutex_lock_nested_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	HANDLE_SIMPLE_FUNC(num_lock);
+	int ret;
+
+	HANDLE_SIMPLE_FUNC(num_lock, ret);
+	return ret;
 }
 
 static int
 mutex_unlock_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	HANDLE_SIMPLE_FUNC(num_unlock);
+	int ret;
+
+	HANDLE_SIMPLE_FUNC(num_unlock, ret);
+	return ret;
 }
 
 static int up_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	HANDLE_SIMPLE_FUNC(num_up);
+	int ret;
+
+	HANDLE_SIMPLE_FUNC(num_up, ret);
+	return ret;
 }
 
 static int
 down_intr_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	HANDLE_SIMPLE_FUNC(num_down);
+	int ret;
+
+	HANDLE_SIMPLE_FUNC(num_down, ret);
+	return ret;
 }
 
 
@@ -227,10 +252,9 @@ static int tracer_release(struct inode *inode, struct file *file)
 static struct proc_info *create_proc_node(pid_t pid)
 {
 	struct proc_info *pi = kcalloc(1, sizeof(*pi), GFP_KERNEL);
-	if (!pi) {
-		pr_err("Failed to allocate memory for proc_info\n");
+
+	if (!pi)
 		return NULL;
-	}
 
 	hash_init(pi->mem);
 	pi->pid = pid;
@@ -240,10 +264,12 @@ static struct proc_info *create_proc_node(pid_t pid)
 
 static long tracer_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
+	size_t i;
+	struct addr_info *ai;
 	struct proc_info *pi;
+	struct hlist_node *tmp;
 
-	switch (cmd)
-	{
+	switch (cmd) {
 	case TRACER_ADD_PROCESS:
 		pi = create_proc_node(arg);
 		if (!pi)
@@ -266,14 +292,14 @@ static long tracer_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		hash_del_rcu(&pi->node);
 		spin_unlock(&lock);
 		synchronize_rcu();
+
+		hash_free(pi->mem, i, tmp, ai, ;);
 		kfree(pi);
-		// TODO: free(hashtable intern)
 
 		break;
 	default:
 		pr_err("Undefined IOCTL command\n");
 		return -EINVAL;
-		break;
 	}
 	return 0;
 }
@@ -346,6 +372,7 @@ static struct kretprobe kprobes[] = {
 static void unregister_probes(size_t pos)
 {
 	size_t i;
+
 	for (i = 0; i != pos; ++i)
 		unregister_kretprobe(kprobes + i);
 }
@@ -391,18 +418,13 @@ static void free_hash_tables(void)
 {
 	size_t i, j;
 	struct proc_info *pi;
-	struct proc_info *ai;
+	struct addr_info *ai;
 	struct hlist_node *tmp_procs, *tmp_addr;
 
-	hash_for_each_safe(procs, i, tmp_procs, pi, node) {
-		hash_for_each_safe(pi->mem, j, tmp_addr, ai, node) {
-			hash_del(tmp_addr);
-			kfree(ai);
-		}
-
-		hash_del(tmp_procs);
-		kfree(pi);
-	}
+	hash_free(
+		procs, i, tmp_procs, pi,
+		hash_free(pi->mem, j, tmp_addr, ai, ;)
+	);
 }
 
 static void __exit kretprobe_exit(void)
