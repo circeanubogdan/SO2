@@ -30,6 +30,7 @@
 #define SCHEDULE_FUNC			"schedule"
 #define UP_FUNC				"up"
 #define DOWN_INTR_FUNC			"down_interruptible"
+#define DO_EXIT_FUNC			"do_exit"
 
 #define HANDLE_SIMPLE_FUNC(field, ret)					\
 	do {								\
@@ -93,6 +94,27 @@ static struct proc_info *get_node(pid_t pid)
 	return NULL;
 }
 
+static int remove_proc(pid_t pid)
+{
+	size_t i;
+	struct addr_info *ai;
+	struct hlist_node *tmp;
+	struct proc_info *pi = get_node(pid);
+
+	if (!pi)
+		return -EINVAL;
+
+	spin_lock(&lock);
+	hash_del_rcu(&pi->node);
+	spin_unlock(&lock);
+	synchronize_rcu();
+
+	hash_free(pi->mem, i, tmp, ai, ;);
+	kfree(pi);
+
+	return 0;
+}
+
 
 static int
 kmalloc_entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
@@ -103,7 +125,7 @@ kmalloc_entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 
 static struct addr_info *create_addr_node(size_t addr, size_t size)
 {
-	struct addr_info *node = kcalloc(1, sizeof(*node), GFP_ATOMIC);
+	struct addr_info *node = kmalloc(sizeof(*node), GFP_ATOMIC);
 
 	if (!node)
 		return NULL;
@@ -200,6 +222,11 @@ down_intr_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 	return ret;
 }
 
+static int do_exit_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	return remove_proc(current->pid);
+}
+
 
 static int tracer_print(struct seq_file *m, void *v)
 {
@@ -264,10 +291,8 @@ static struct proc_info *create_proc_node(pid_t pid)
 
 static long tracer_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-	size_t i;
-	struct addr_info *ai;
+	int ret;
 	struct proc_info *pi;
-	struct hlist_node *tmp;
 
 	switch (cmd) {
 	case TRACER_ADD_PROCESS:
@@ -280,22 +305,13 @@ static long tracer_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		spin_unlock(&lock);
 
 		break;
-
 	case TRACER_REMOVE_PROCESS:
-		pi = get_node(arg);
-		if (!pi) {
+		ret = remove_proc(arg);
+		if (ret) {
 			pr_err("PID %ld not found\n", arg);
-			return -EINVAL;
+			return ret;
 		}
-
-		spin_lock(&lock);
-		hash_del_rcu(&pi->node);
-		spin_unlock(&lock);
-		synchronize_rcu();
-
-		hash_free(pi->mem, i, tmp, ai, ;);
-		kfree(pi);
-
+	
 		break;
 	default:
 		pr_err("Undefined IOCTL command\n");
@@ -365,6 +381,11 @@ static struct kretprobe kprobes[] = {
 		.entry_handler = down_intr_handler,
 		.maxactive = MAX_ACTIVE,
 		.kp.symbol_name = DOWN_INTR_FUNC
+	},
+	{
+		.entry_handler = do_exit_handler,
+		.maxactive = MAX_ACTIVE,
+		.kp.symbol_name = DO_EXIT_FUNC
 	}
 };
 
