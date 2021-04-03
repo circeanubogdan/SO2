@@ -109,6 +109,10 @@ static int remove_proc(pid_t pid)
 	spin_unlock(&lock);
 	synchronize_rcu();
 
+	/**
+	 * With RCU, no other process references pi, so no locking is needed
+	 * here, because there can be no race conditions.
+	 * */
 	hash_free(pi->mem, i, tmp, ai, ;);
 	kfree(pi);
 
@@ -382,6 +386,7 @@ static struct kretprobe kprobes[] = {
 		.maxactive = MAX_ACTIVE,
 		.kp.symbol_name = DOWN_INTR_FUNC
 	},
+	/* Handler to remove processes from the hashtable when they exit. */
 	{
 		.entry_handler = do_exit_handler,
 		.maxactive = MAX_ACTIVE,
@@ -453,6 +458,12 @@ static void __exit kretprobe_exit(void)
 	misc_deregister(&tracer_dev);
 	proc_remove(tracer_read);
 	unregister_probes(sizeof(kprobes) / sizeof(*kprobes) + 1);
+
+	/**
+	 * At this point, the hashtables can no longer be altered by any other
+	 * process, rmmod being the only one who has access to the hashtables.
+	 * Thus, no locking is needed.
+	 */
 	free_hash_tables();
 }
 
