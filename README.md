@@ -44,6 +44,13 @@ apeluri (mai mult sau mai putin blocante) sau seteaza timere pentru a demonstra
 mecanismele *deferred work*
 
 
+### Lab 6 - Maparea memoriei
+Labul presupune 2 module care implementeaza apelul `mmap()`, precum si
+operatiile de citire si scriere din si in memoria mapata cu `mmap`. Cele 2
+module difera prin faptul ca unul aloca memoria continuu d.p.d.v fizic, cu
+`kmalloc()`, pe cand celalalt nu, folosind `vmalloc()`.
+
+
 
 ## Teme
 ### Tema 0 - API-ul de liste din Kernel
