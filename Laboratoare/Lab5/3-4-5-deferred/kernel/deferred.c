@@ -49,6 +49,19 @@ static struct my_device_data {
 	spinlock_t lock;
 } dev;
 
+
+static inline void refcount_dec_putu(refcount_t *r, int *oldp)
+{
+	int old = atomic_fetch_sub_release(1, &r->refs);
+
+	if (oldp)
+		*oldp = old;
+
+	if (unlikely(old < 1))
+		refcount_warn_saturate(r, REFCOUNT_DEC_LEAK);
+}
+
+
 static void alloc_io(void)
 {
 	set_current_state(TASK_INTERRUPTIBLE);
@@ -122,8 +135,7 @@ static void timer_handler(struct timer_list *tl)
 					proc->task->comm
 				);
 
-				refcount_dec(&proc->task->usage);
-				// put_task_struct(proc->task);
+				refcount_dec_putu(&proc->task->usage);
 				kfree(proc);
 			}
 		}
@@ -252,7 +264,6 @@ static void deferred_exit(void)
 		/* TODO 4: ... free the struct mon_proc */
 	list_for_each_safe(p, tmp, &dev.procs) {
 		proc = list_entry(p, struct mon_proc, list);
-		refcount_dec(&proc->task->usage);
 		kfree(proc);
 
 		list_del(p);

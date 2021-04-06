@@ -37,6 +37,13 @@ care indica tastele apasate.
 Continutul bufferului poate fi citit sau sters accesand fisierul `/dev/kbd`.
 
 
+### Lab 5 - Actiuni amanabile
+Se creaza un dispozitiv caracter controlabil din user space prin `ioctl()`, care
+in functie de comenzile primite (catre `/dev/deferred`) realizeaza o serie de
+apeluri (mai mult sau mai putin blocante) sau seteaza timere pentru a demonstra
+mecanismele *deferred work*
+
+
 
 ## Teme
 ### Tema 0 - API-ul de liste din Kernel
