@@ -50,3 +50,22 @@ sunt:
 
 Lista poate fi vizualizata, cate un string pe linie, citind din fisierul
 `/proc/list/preview`.
+
+
+### Tema 1 - Kretprobes
+Se folosesc Kretprobes pentru a monitoriza urmatoarele functii apelate de
+procesele din Kernel:
+- `kmalloc`
+- `kfree`
+- `mutex_lock_nested`
+- `mutex_unlock`
+- `schedule`
+- `up`
+- `down_interruptible`
+
+Se numara apelurile functiilor de mai sus, iar, pentru cele ce aloca sau
+dealoca memorie, se si contorizeaza memoria alocata, respectiv eliberata.
+
+Prin apeluri de `ioctl()` din user space pe `/dev/tracer`, se pot adauga sau
+scoate de sub observatie anumite procese. Statisticile colectate prin probele
+de mai sus pot fi vazute citind din `/proc/tracer`.

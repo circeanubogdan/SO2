@@ -20,7 +20,8 @@
 
 #include "tracer.h"
 
-#define HT_BITS				10
+#define MEM_HT_BITS			10
+#define PROCS_HT_BITS			8
 #define PROC_TRACER			"tracer"
 #define MAX_ACTIVE			32
 #define KMALLOC_FUNC			"__kmalloc"
@@ -34,13 +35,16 @@
 
 #define HANDLE_SIMPLE_FUNC(field, ret)					\
 	do {								\
-		struct proc_info *pi = get_node(current->pid);		\
+		struct proc_info *pi;					\
+		rcu_read_lock();					\
+		pi = get_node(current->pid);				\
 		if (!pi) {						\
 			ret = -EINVAL;					\
-			break;						\
+		} else {						\
+			++pi->field;					\
+			ret = 0;					\
 		}							\
-		++pi->field;						\
-		ret = 0;						\
+		rcu_read_unlock();					\
 	} while (0)
 
 #define hash_free(ht, idx, tmp, ptr, extra)				\
@@ -64,7 +68,7 @@ struct proc_info {
 	uint num_unlock;
 	size_t kmalloc_mem;
 	size_t kfree_mem;
-	DECLARE_HASHTABLE(mem, 3);
+	DECLARE_HASHTABLE(mem, MEM_HT_BITS);
 	struct hlist_node node;
 };
 
@@ -75,21 +79,17 @@ struct addr_info {
 };
 
 
-static DEFINE_HASHTABLE(procs, HT_BITS);
-static DEFINE_SPINLOCK(lock);
+static DEFINE_HASHTABLE(procs, PROCS_HT_BITS);
+spinlock_t locks[1 << PROCS_HT_BITS];
 
 
 static struct proc_info *get_node(pid_t pid)
 {
 	struct proc_info *pi;
 
-	rcu_read_lock();
 	hash_for_each_possible_rcu_notrace(procs, pi, node, pid)
-		if (pi->pid == pid) {
-			rcu_read_unlock();
+		if (pi->pid == pid)
 			return pi;
-		}
-	rcu_read_unlock();
 
 	return NULL;
 }
@@ -104,9 +104,9 @@ static int remove_proc(pid_t pid)
 	if (!pi)
 		return -EINVAL;
 
-	spin_lock(&lock);
+	spin_lock(locks + hash_min(pid, HASH_BITS(locks)));
 	hash_del_rcu(&pi->node);
-	spin_unlock(&lock);
+	spin_unlock(locks + hash_min(pid, HASH_BITS(locks)));
 	synchronize_rcu();
 
 	/**
@@ -146,18 +146,24 @@ kmalloc_exit_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 	struct addr_info *ai;
 	size_t size = *(size_t *)ri->data;
 	size_t addr = regs_return_value(regs);
-	struct proc_info *pi = get_node(current->pid);
-
-	if (!pi)
-		return -EINVAL;
+	struct proc_info *pi;
 
 	ai = create_addr_node(addr, size);
 	if (!ai)
 		return -EINVAL;
 
+	rcu_read_lock();
+	pi = get_node(current->pid);
+	if (!pi) {
+		kfree(ai);
+		rcu_read_unlock();
+		return -EINVAL;
+	}
+
 	hash_add(pi->mem, &ai->node, addr);
 	++pi->num_kmalloc;
 	pi->kmalloc_mem += size;
+	rcu_read_unlock();
 
 	return 0;
 }
@@ -167,20 +173,27 @@ static int kfree_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 	struct addr_info *ai;
 	struct hlist_node *tmp;
 	size_t addr = regs->ax;
-	struct proc_info *pi = get_node(current->pid);
+	struct proc_info *pi;
+	int ret = -EINVAL;
 
-	if (!pi)
+	rcu_read_lock();
+	pi = get_node(current->pid);
+	if (!pi) {
+		rcu_read_unlock();
 		return -EINVAL;
+	}
 
 	hash_for_each_possible_safe(pi->mem, ai, tmp, node, addr)
 		if (addr == ai->addr) {
 			++pi->num_kfree;
 			pi->kfree_mem += ai->size;
 
-			return 0;
+			ret = 0;
+			break;
 		}
+	rcu_read_unlock();
 
-	return -EINVAL;
+	return ret;
 }
 
 static int schedule_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
@@ -304,9 +317,9 @@ static long tracer_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		if (!pi)
 			return -ENOMEM;
 
-		spin_lock(&lock);
+		spin_lock(locks + hash_min(arg, HASH_BITS(locks)));
 		hash_add_rcu(procs, &pi->node, arg);
-		spin_unlock(&lock);
+		spin_unlock(locks + hash_min(arg, HASH_BITS(locks)));
 
 		break;
 	case TRACER_REMOVE_PROCESS:
@@ -408,6 +421,9 @@ static int __init kretprobe_init(void)
 	int ret;
 	size_t i, num_probes = sizeof(kprobes) / sizeof(*kprobes);
 
+	for (i = 0; i != ARRAY_SIZE(locks); ++i)
+		spin_lock_init(locks + i);
+
 	for (i = 0; i != num_probes; ++i) {
 		ret = register_kretprobe(kprobes + i);
 		if (ret) {
@@ -461,7 +477,8 @@ static void __exit kretprobe_exit(void)
 
 	/**
 	 * At this point, the hashtables can no longer be altered by any other
-	 * process, rmmod being the only one who has access to the hashtables.
+	 * process, rmmod being the only one who can access it, since everything
+	 * else (probes, /dev and /proc entries) has been removed.
 	 * Thus, no locking is needed.
 	 */
 	free_hash_tables();
