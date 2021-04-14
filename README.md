@@ -51,6 +51,11 @@ module difera prin faptul ca unul aloca memoria continuu d.p.d.v fizic, cu
 `kmalloc()`, pe cand celalalt nu, folosind `vmalloc()`.
 
 
+### Lab 7 - Managementul memoriei
+O relativa continuare a labului trecut, se implementeaza un dispozitiv bloc
+"virtual", care tine datele in *RAM*.
+
+
 
 ## Teme
 ### Tema 0 - API-ul de liste din Kernel
