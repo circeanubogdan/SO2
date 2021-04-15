@@ -81,20 +81,18 @@ static long uart_ioctl(
 )
 {
 	int ret = 0;
-	struct uart16550_line_info *info;
+	struct uart16550_line_info info;
 
-	if (!virt_addr_valid(arg)) {
+	if (copy_from_user(&info, (void *)arg, sizeof(info))) {
 		pr_err("Invalid address: 0x%X\n", arg);
 		return -EFAULT;
 	}
 
-	info = (struct uart16550_line_info *)arg;
-
 	switch (cmd) {
 	case UART16550_IOCTL_SET_LINE:
 		pr_info("New parameters:\n");
-		pr_info("Baud: %d, len: %d\n", info->baud, info->len);
-		pr_info("Par: %d, stop: %d\n", info->par, info->stop);
+		pr_info("Baud: %d, len: %d\n", info.baud, info.len);
+		pr_info("Par: %d, stop: %d\n", info.par, info.stop);
 
 		break;
 
