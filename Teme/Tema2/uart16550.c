@@ -51,8 +51,8 @@
 
 #define AO2			3
 
-#define RDAI_BITS		1
-#define THREI_BITS		2
+#define RDAI_BITS		(1 << 1)
+#define THREI_BITS		(1 << 2)
 
 #define GET_BIT(reg, idx)	(reg & (1 << idx))
 #define SET_BIT(reg, idx)	(reg | (1 << idx))
@@ -113,30 +113,28 @@ static ssize_t uart_read(
 	int ret;
 	size_t to_read, len;
 	char buff[KFIFO_SIZE];
-	struct com_dev *dev = (struct com_dev *) file->private_data;
+	struct com_dev *dev = (struct com_dev *)file->private_data;
 
-	pr_info("Let's wait\n");
-
+	// pr_info("astept sa citesc\n");
 	ret = wait_event_interruptible(
-		dev->rx_wq,
-		!kfifo_is_empty_spinlocked(&dev->rx_fifo, &dev->rx_lock)
+		dev->tx_wq,
+		!kfifo_is_empty(&dev->tx_fifo)
 	);
 	if (ret)
 		return -EINVAL;  // TODO: alta eroare?
+	// pr_info("am fost trezit sa citesc\n");
 
-	pr_info("Read up\n");
-
-	len = kfifo_len(&dev->rx_fifo);
+	len = kfifo_len(&dev->tx_fifo);
 	to_read = size < len ? size : len;
 
-	kfifo_out_spinlocked(&dev->rx_fifo, buff, to_read, &dev->rx_lock);
+	kfifo_out_spinlocked(&dev->tx_fifo, buff, to_read, &dev->tx_lock);
 
 	if (copy_to_user(user_buffer, buff, to_read))
 		return -EFAULT;
 
-	/* Reenable RDAI */
+	/* Reenable THREI */
 	outb(
-		SET_BIT(inb(IER(addr[dev->com_no])), RDAI),
+		SET_BIT(inb(IER(addr[dev->com_no])), THREI),
 		IER(addr[dev->com_no])
 	);
 
@@ -153,26 +151,28 @@ static ssize_t uart_write(
 	int ret;
 	size_t to_write, len;
 	char buff[KFIFO_SIZE];
-	struct com_dev *dev = (struct com_dev *) file->private_data;
+	struct com_dev *dev = (struct com_dev *)file->private_data;
 
+	// pr_info("astept sa scriu\n");
 	ret = wait_event_interruptible(
 		dev->rx_wq,
-		!kfifo_is_full(&dev->tx_fifo)
+		!kfifo_is_full(&dev->rx_fifo)
 	);
 	if (ret)
 		return -EINVAL;  // TODO: alta eroare?
+	// pr_info("am fost trezit sa scriu\n");
 
-	len = kfifo_len(&dev->tx_fifo);
+	len = kfifo_len(&dev->rx_fifo);
 	to_write = size < len ? size : len;
 
 	if (copy_from_user(buff, user_buffer, to_write))
 		return -EFAULT;
 
-	kfifo_in_spinlocked(&dev->tx_fifo, buff, to_write, &dev->tx_lock);
+	kfifo_in_spinlocked(&dev->rx_fifo, buff, to_write, &dev->rx_lock);
 
-	/* Reenable THREI */
+	/* Reenable RDAI */
 	outb(
-		SET_BIT(inb(IER(addr[dev->com_no])), THREI),
+		SET_BIT(inb(IER(addr[dev->com_no])), RDAI),
 		IER(addr[dev->com_no])
 	);
 
@@ -188,7 +188,7 @@ static long uart_ioctl(
 	int ret = 0;
 	char config;
 	struct uart16550_line_info info;
-	struct com_dev *dev = (struct com_dev *) file->private_data;
+	struct com_dev *dev = (struct com_dev *)file->private_data;
 
 	if (copy_from_user(&info, (void *)arg, sizeof(info))) {
 		pr_err("Invalid address: 0x%lX\n", arg);
@@ -240,7 +240,7 @@ static const struct file_operations uart_fops = {
 
 static irqreturn_t com_interrupt_handler(int irq_no, void *dev_id)
 {
-	struct com_dev *dev = (struct com_dev *) dev_id;
+	struct com_dev *dev = (struct com_dev *)dev_id;
 
 	char iir = inb(IIR(addr[dev->com_no]));
 	char type = IIR_INT_TYPE(iir);
@@ -249,48 +249,62 @@ static irqreturn_t com_interrupt_handler(int irq_no, void *dev_id)
 	// if (GET_BIT(iir, IPF))
 	// 	return IRQ_NONE;
 
-	pr_info("Irq %d, %d\n", irq_no, dev->com_no);
+	// pr_info("Irq nr = %d, com = %d; tip = %d\n", irq_no, dev->com_no, type);
 
-	if (type == RDAI_BITS) {
-		pr_info("RDAI\n");
+	switch (type) {
+	case THREI_BITS:
+		// pr_info("THREI\n");
 		byte = inb(RBR(addr[dev->com_no]));
-		kfifo_in_spinlocked_noirqsave(
-			&dev->rx_fifo,
-			&byte,
-			1,
-			&dev->rx_lock
-		);
-
-		if (kfifo_is_full(&dev->rx_fifo))
-			outb(
-				CLEAR_BIT(inb(IER(addr[dev->com_no])), RDAI),
-				IER(addr[dev->com_no])
-			);
-
-		pr_info("Let's wake up\n");
-
-		wake_up(&dev->rx_wq);
-	}
-
-	if (type == THREI_BITS) {
-		kfifo_out_spinlocked_noirqsave(
+		kfifo_in_spinlocked(
 			&dev->tx_fifo,
 			&byte,
 			1,
 			&dev->tx_lock
 		);
-		outb(byte, THR(addr[dev->com_no]));
 
-		if (kfifo_is_empty_spinlocked_noirqsave(
-			&dev->tx_fifo,
-			&dev->tx_lock
-		))
+		// pr_info(
+		// 	"kfifo_tx are %d elem; dim = %d si %d e plin\n",
+		// 	kfifo_len(&dev->tx_fifo),
+		// 	kfifo_size(&dev->tx_fifo),
+		// 	kfifo_is_full(&dev->tx_fifo)
+		// );
+
+		if (kfifo_is_full(&dev->tx_fifo))
 			outb(
 				CLEAR_BIT(inb(IER(addr[dev->com_no])), THREI),
 				IER(addr[dev->com_no])
 			);
 
+		// pr_info("trezesc cititor\n");
+
 		wake_up(&dev->tx_wq);
+		break;
+	
+	case RDAI_BITS:
+		kfifo_out_spinlocked_noirqsave(
+			&dev->rx_fifo,
+			&byte,
+			1,
+			&dev->rx_lock
+		);
+		outb(byte, THR(addr[dev->com_no]));
+
+		if (kfifo_is_empty_spinlocked_noirqsave(
+			&dev->rx_fifo,
+			&dev->rx_lock
+		))
+			outb(
+				CLEAR_BIT(inb(IER(addr[dev->com_no])), RDAI),
+				IER(addr[dev->com_no])
+			);
+
+		// pr_info("trezesc scriitor\n");
+
+		wake_up(&dev->rx_wq);
+		break;
+
+	default:
+		return IRQ_NONE;
 	}
 
 	return IRQ_HANDLED;
@@ -299,22 +313,16 @@ static irqreturn_t com_interrupt_handler(int irq_no, void *dev_id)
 static int add_device(enum coms com_no)
 {
 	int ret;
-	char config = 0;
 
 	spin_lock_init(&devs[com_no].rx_lock);
 	init_waitqueue_head(&devs[com_no].rx_wq);
+	INIT_KFIFO(devs[com_no].rx_fifo);
 
 	spin_lock_init(&devs[com_no].tx_lock);
 	init_waitqueue_head(&devs[com_no].tx_wq);
+	INIT_KFIFO(devs[com_no].tx_fifo);
 
 	devs[com_no].com_no = com_no;
-
-	/* Enable interrupts */
-	outb(SET_BIT(config, AO2), MCR(addr[com_no]));
-
-	/* Enable RDAI and THREI */
-	config = 0;
-	outb(SET_BIT(SET_BIT(config, RDAI), THREI), IER(addr[com_no]));
 
 	cdev_init(&devs[com_no].cdev, &uart_fops);
 	ret = cdev_add(
@@ -324,6 +332,12 @@ static int add_device(enum coms com_no)
 	);
 	if (ret)
 		pr_err("cdev_add failed: %d\n", ret);
+
+	/* Enable RDAI and THREI */
+	outb(SET_BIT(SET_BIT(0, RDAI), THREI), IER(addr[com_no]));
+
+	/* Enable interrupts */
+	outb(SET_BIT(0, AO2), MCR(addr[com_no]));
 
 	return ret;
 }
@@ -381,7 +395,7 @@ static int __init uart_init(void)
 	int region_minor = minor[COM1];
 	int region_no = SINGLE_MINOR;
 
-	pr_info("option: %d\n", option);
+	// pr_info("option: %d\n", option);
 
 	// TODO: arata naspa
 	if (option == OPTION_COM2)
