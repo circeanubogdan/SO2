@@ -7,6 +7,7 @@
  *	Adina Smeu <adina.smeu@gmail.com>,
  *	Teodor Dutu <teodor.dutu@gmail.com>
  */
+
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/module.h>
@@ -20,13 +21,14 @@
 
 #include "uart16550.h"
 
+
 #define MODULE_NAME		"uart16550"
 
 #define DEFAULT_MAJOR		42
 
 #define REGION_SIZE		8
 
-#define SINGLE_MINOR		1
+#define ONE_MINOR		1
 #define ALL_MINORS		2
 
 #define KFIFO_SIZE		512
@@ -51,12 +53,15 @@
 
 #define AO2			3
 
-#define RDAI_BITS		(1 << 1)
-#define THREI_BITS		(1 << 2)
+#define THREI_BITS		(1 << 1)
+#define RDAI_BITS		(1 << 2)
 
 #define GET_BIT(reg, idx)	(reg & (1 << idx))
 #define SET_BIT(reg, idx)	(reg | (1 << idx))
 #define CLEAR_BIT(reg, idx)	(reg & ~(1 << idx))
+
+#define MIN(x, y)		((x) < (y) ? (x) : (y))
+
 
 enum coms {COM1 = 0, COM2};
 
@@ -67,29 +72,23 @@ static const int minor[] = {0, 1};
 
 static struct com_dev {
 	struct cdev cdev;
-
 	enum coms com_no;
-
-	spinlock_t rx_lock;
-	wait_queue_head_t rx_wq;
+	spinlock_t rx_lock, tx_lock;
+	wait_queue_head_t rx_wq, tx_wq;
 	DECLARE_KFIFO(rx_fifo, char, KFIFO_SIZE);
-
-	spinlock_t tx_lock;
-	wait_queue_head_t tx_wq;
 	DECLARE_KFIFO(tx_fifo, char, KFIFO_SIZE);
-
-	// TODO: erori daca nu e configurat
+	bool configed;
 } devs[ALL_MINORS];
 
 
 static int major = DEFAULT_MAJOR;
 static int option = OPTION_BOTH;
 
-// TODO: Verifica permisiuni
 module_param(major, int, 0);
 MODULE_PARM_DESC(major, "The major with which the device must be registered");
 module_param(option, int, 0);
 MODULE_PARM_DESC(option, "The registered serial ports");
+
 
 static int uart_open(struct inode *inode, struct file *file)
 {
@@ -115,33 +114,37 @@ static ssize_t uart_read(
 	char buff[KFIFO_SIZE];
 	struct com_dev *dev = (struct com_dev *)file->private_data;
 
-	// pr_info("astept sa citesc\n");
+	if (!dev->configed) {
+		pr_err("Device not configured\n");
+		return ret;
+	}
+
 	ret = wait_event_interruptible(
-		dev->tx_wq,
-		!kfifo_is_empty_spinlocked(&dev->tx_fifo, &dev->tx_lock)
+		dev->rx_wq,
+		!kfifo_is_empty_spinlocked(&dev->rx_fifo, &dev->rx_lock)
 	);
-	if (ret)
-		return -EINVAL;  // TODO: alta eroare?
-	// pr_info("am fost trezit sa citesc\n");
+	if (ret) {
+		pr_err("wait_event_interruptible failed for read\n");
+		return ret;
+	}
 
-	len = kfifo_len(&dev->tx_fifo);
-	to_read = size < len ? size : len;
+	len = kfifo_len(&dev->rx_fifo);
+	to_read = MIN(size, len);
 
-	// pr_info("citesc %zu din %zu\n", to_read, size);
+	kfifo_out_spinlocked(&dev->rx_fifo, buff, to_read, &dev->rx_lock);
 
-	kfifo_out_spinlocked(&dev->tx_fifo, buff, to_read, &dev->tx_lock);
-
-	if (copy_to_user(user_buffer, buff, to_read))
+	if (copy_to_user(user_buffer, buff, to_read)) {
+		pr_err("Failed to copy data to user\n");
 		return -EFAULT;
+	}
 
-	/* Reenable THREI */
-	if (len == kfifo_size(&dev->tx_fifo))
+	/* Kfifo is no longer full, thus reenable reads. */
+	if (len == kfifo_size(&dev->rx_fifo))
 		outb(
-			SET_BIT(inb(IER(addr[dev->com_no])), THREI),
+			SET_BIT(inb(IER(addr[dev->com_no])), RDAI),
 			IER(addr[dev->com_no])
 		);
 
-	*offset += to_read;  // TODO: mai e nevoie? nu-l folosesc
 	return to_read;
 }
 
@@ -156,31 +159,37 @@ static ssize_t uart_write(
 	char buff[KFIFO_SIZE];
 	struct com_dev *dev = (struct com_dev *)file->private_data;
 
-	// pr_info("astept sa scriu\n");
+	if (!dev->configed) {
+		pr_err("Device not configured\n");
+		return ret;
+	}
+
 	ret = wait_event_interruptible(
-		dev->rx_wq,
-		!kfifo_is_full(&dev->rx_fifo)
+		dev->tx_wq,
+		!kfifo_is_full(&dev->tx_fifo)
 	);
-	if (ret)
-		return -EINVAL;  // TODO: alta eroare?
-	// pr_info("am fost trezit sa scriu\n");
+	if (ret) {
+		pr_err("wait_event_interruptible failed for write\n");
+		return ret;
+	}
 
-	avail = kfifo_avail(&dev->rx_fifo);
-	to_write = size > avail ? avail : size;
+	avail = kfifo_avail(&dev->tx_fifo);
+	to_write = MIN(size, avail);
 
-	if (copy_from_user(buff, user_buffer, to_write))
+	if (copy_from_user(buff, user_buffer, to_write)) {
+		pr_err("Failed to copy data from user\n");
 		return -EFAULT;
+	}
 
-	kfifo_in_spinlocked(&dev->rx_fifo, buff, to_write, &dev->rx_lock);
+	kfifo_in_spinlocked(&dev->tx_fifo, buff, to_write, &dev->tx_lock);
 
-	/* Reenable RDAI */
+	/* Kfifo is no longer empty, thus reenable writes. */
 	if (avail == kfifo_size(&dev->tx_fifo))
 		outb(
-			SET_BIT(inb(IER(addr[dev->com_no])), RDAI),
+			SET_BIT(inb(IER(addr[dev->com_no])), THREI),
 			IER(addr[dev->com_no])
 		);
 
-	*offset += to_write;  // TODO: mai e nevoie? nu-l folosesc
 	return to_write;
 }
 
@@ -201,32 +210,21 @@ static long uart_ioctl(
 
 	switch (cmd) {
 	case UART16550_IOCTL_SET_LINE:
-		pr_info("New parameters:\n");
-		pr_info("Baud: %d, len: %d\n", info.baud, info.len);
-		pr_info("Par: %d, stop: %d\n", info.par, info.stop);
-
 		config = info.par | info.stop | info.len;
 
 		/* LCR = {1b'{dlab}, 1b'{}, 3b'{par}, 1b'{stop}, 2b'{len}} */
 		outb(SET_BIT(config, DLAB), LCR(addr[dev->com_no]));
 
 		/*
-		 * {DLH, DLL} = baud. We set DLH to 0 since `baud` from
+		 * {DLH, DLL} = baud. Set DLH to 0 since `baud` from
 		 * `struct uart16550_line_info` has only 8 bits.
 		 */
 		outb(info.baud, DLL(addr[dev->com_no]));
 		outb(0, DLH(addr[dev->com_no]));
-
-		pr_info(
-			"Config: %d, Baud: %d\n",
-			inb(LCR(addr[dev->com_no])),
-			inb(DLL(addr[dev->com_no]))
-		);
-
 		outb(CLEAR_BIT(config, DLAB), LCR(addr[dev->com_no]));
 
+		dev->configed = true;
 		break;
-
 	default:
 		ret = -EINVAL;
 	}
@@ -244,87 +242,61 @@ static const struct file_operations uart_fops = {
 
 static irqreturn_t com_interrupt_handler(int irq_no, void *dev_id)
 {
-	struct com_dev *dev = (struct com_dev *)dev_id;
-
+	char byte;
+	struct com_dev *dev = (struct com_dev *)dev_id;	
 	char iir = inb(IIR(addr[dev->com_no]));
 	char type = IIR_INT_TYPE(iir);
-	char byte;
-	static int num_rdai, num_threi, num_unk;
 
-	// if (GET_BIT(iir, IPF))
-	// 	return IRQ_NONE;
-
-	if (type == RDAI_BITS)
-		++num_rdai;
-	else if (type == THREI_BITS)
-		++num_threi;
-	else
-		++num_unk;
-
-	// pr_info("rdai = %d; threi = %d; unk = %d\n", num_rdai, num_threi, num_unk);
-
-	// if (type == THREI_BITS)
-	// 	pr_info("Irq nr = %d, com = %d; tip = %d\n", irq_no, dev->com_no, type);
+	if (!dev->configed) {
+		pr_err("Device not configured\n");
+		return IRQ_NONE;
+	}
 
 	switch (type) {
-	case THREI_BITS:
-		// pr_info("THREI\n");
+	case RDAI_BITS:
 		byte = inb(RBR(addr[dev->com_no]));
 		kfifo_in_spinlocked_noirqsave(
-			&dev->tx_fifo,
-			&byte,
-			1,
-			&dev->tx_lock
-		);
-		// kfifo_in(&dev->tx_fifo, &byte, 1);
-
-		// pr_info(
-		// 	"kfifo_tx are %d elem; dim = %d si %d e plin\n",
-		// 	kfifo_len(&dev->tx_fifo),
-		// 	kfifo_size(&dev->tx_fifo),
-		// 	kfifo_is_full(&dev->tx_fifo)
-		// );
-
-		if (kfifo_is_full(&dev->tx_fifo))
-			outb(
-				CLEAR_BIT(inb(IER(addr[dev->com_no])), THREI),
-				IER(addr[dev->com_no])
-			);
-
-		// pr_info("trezesc cititor\n");
-
-		wake_up(&dev->tx_wq);
-		break;
-	
-	case RDAI_BITS:
-		kfifo_out_spinlocked_noirqsave(
 			&dev->rx_fifo,
 			&byte,
-			1,
+			sizeof(byte),
 			&dev->rx_lock
 		);
-		outb(byte, THR(addr[dev->com_no]));
 
-		if (kfifo_is_empty_spinlocked_noirqsave(
-			&dev->rx_fifo,
-			&dev->rx_lock
-		))
+		if (kfifo_is_full(&dev->rx_fifo))
 			outb(
 				CLEAR_BIT(inb(IER(addr[dev->com_no])), RDAI),
 				IER(addr[dev->com_no])
 			);
 
-		// pr_info("trezesc scriitor\n");
-
 		wake_up(&dev->rx_wq);
 		break;
+	case THREI_BITS:
+		kfifo_out_spinlocked_noirqsave(
+			&dev->tx_fifo,
+			&byte,
+			sizeof(byte),
+			&dev->tx_lock
+		);
+		outb(byte, THR(addr[dev->com_no]));
 
+		if (kfifo_is_empty_spinlocked_noirqsave(
+			&dev->tx_fifo,
+			&dev->tx_lock
+		))
+			outb(
+				CLEAR_BIT(inb(IER(addr[dev->com_no])), THREI),
+				IER(addr[dev->com_no])
+			);
+
+		wake_up(&dev->tx_wq);
+		break;
 	default:
 		return IRQ_NONE;
 	}
 
 	return IRQ_HANDLED;
 }
+
 
 static int add_device(enum coms com_no)
 {
@@ -340,11 +312,7 @@ static int add_device(enum coms com_no)
 
 	devs[com_no].com_no = com_no;
 
-	/* Enable RDAI and THREI */
-	// outb(SET_BIT(SET_BIT(0, RDAI), THREI), IER(addr[com_no]));
-	pr_info("config = 0x%X\n", SET_BIT(SET_BIT(0, RDAI), THREI));
 	outb(SET_BIT(0, RDAI), IER(addr[com_no]));
-	// outb(0, IER(addr[com_no]));
 
 	/* Enable interrupts */
 	outb(SET_BIT(0, AO2), MCR(addr[com_no]));
@@ -353,10 +321,10 @@ static int add_device(enum coms com_no)
 	ret = cdev_add(
 		&devs[com_no].cdev,
 		MKDEV(major, minor[com_no]),
-		SINGLE_MINOR
+		ONE_MINOR
 	);
 	if (ret)
-		pr_err("cdev_add failed: %d\n", ret);
+		pr_err("cdev_add failed\n");
 
 	return ret;
 }
@@ -383,7 +351,7 @@ static int com_init(enum coms com_no)
 		&devs[com_no]
 	);
 	if (ret < 0) {
-		pr_err("request_irq failed: %d\n", ret);
+		pr_err("request_irq failed\n");
 		goto out_release_region;
 	}
 
@@ -412,11 +380,8 @@ static int __init uart_init(void)
 {
 	int ret = 0;
 	int region_minor = minor[COM1];
-	int region_no = SINGLE_MINOR;
+	int region_no = ONE_MINOR;
 
-	// pr_info("option: %d\n", option);
-
-	// TODO: arata naspa
 	if (option == OPTION_COM2)
 		region_minor = minor[COM2];
 	else if (option == OPTION_BOTH)
@@ -428,7 +393,7 @@ static int __init uart_init(void)
 		MODULE_NAME
 	);
 	if (ret) {
-		pr_err("register_chrdev_region failed: %d\n", ret);
+		pr_err("register_chrdev_region failed\n");
 		goto out_init_err;
 	}
 
@@ -453,7 +418,7 @@ static int __init uart_init(void)
 			goto out_cleanup_com1;
 		break;
 	default:
-		pr_err("unknown option: %d\n", option);
+		pr_err("Unknown option: %d\n", option);
 		ret = -EINVAL;
 		goto out_unregister_region;
 	}
@@ -468,17 +433,16 @@ out_init_err:
 	return ret;
 }
 
-// TODO: lungime linii
 static void __exit uart_exit(void)
 {
 	switch (option) {
 	case OPTION_COM1:
 		com_cleanup(COM1);
-		unregister_chrdev_region(MKDEV(major, minor[COM1]), SINGLE_MINOR);
+		unregister_chrdev_region(MKDEV(major, minor[COM1]), ONE_MINOR);
 		break;
 	case OPTION_COM2:
 		com_cleanup(COM2);
-		unregister_chrdev_region(MKDEV(major, minor[COM2]), SINGLE_MINOR);
+		unregister_chrdev_region(MKDEV(major, minor[COM2]), ONE_MINOR);
 		break;
 	case OPTION_BOTH:
 		com_cleanup(COM1);
@@ -486,12 +450,14 @@ static void __exit uart_exit(void)
 		unregister_chrdev_region(MKDEV(major, minor[COM1]), ALL_MINORS);
 		break;
 	default:
-		pr_err("unknown option: %d\n", option);
+		pr_err("Unknown option: %d\n", option);
 	}
 }
 
+
 module_init(uart_init);
 module_exit(uart_exit);
+
 
 MODULE_DESCRIPTION("UART Driver");
 MODULE_AUTHOR(
