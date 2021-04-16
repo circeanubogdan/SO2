@@ -20,23 +20,23 @@
 
 #include "uart16550.h"
 
-#define MODULE_NAME	"uart16550"
+#define MODULE_NAME		"uart16550"
 
-#define DEFAULT_MAJOR	42
+#define DEFAULT_MAJOR		42
 
-#define REGION_SIZE	8
+#define REGION_SIZE		8
 
-#define SINGLE_MINOR	1
-#define ALL_MINORS	2
+#define SINGLE_MINOR		1
+#define ALL_MINORS		2
 
-#define KFIFO_SIZE	1024
+#define KFIFO_SIZE		1024
 
-#define DLL(base_addr)	(base_addr + 0)
-#define DLH(base_addr)	(base_addr + 1)
-#define IIR(base_addr)	(base_addr + 2)
-#define LCR(base_addr)	(base_addr + 3)
+#define DLL(base_addr)		(base_addr + 0)
+#define DLH(base_addr)		(base_addr + 1)
+#define IIR(base_addr)		(base_addr + 2)
+#define LCR(base_addr)		(base_addr + 3)
 
-#define DLAB		(1 << 7)
+#define DLAB			(1 << 7)
 
 enum coms {COM1 = 0, COM2};
 
@@ -89,30 +89,29 @@ static ssize_t uart_read(
 	char __user *user_buffer,
 	size_t size,
 	loff_t *offset
-)
-{
+) {
+	int ret;
+	size_t to_read, len;
+	char buff[KFIFO_SIZE];
 	struct com_dev *dev = (struct com_dev *) file->private_data;
 
-	// TODO:
+	ret = wait_event_interruptible(
+		dev->rx_wq,
+		!kfifo_is_empty_spinlocked(&dev->rx_fifo, &dev->rx_lock)
+	);
+	if (ret)
+		return -EINVAL;  // TODO: alta eroare?
 
-	// alte configurari
+	len = kfifo_len(&dev->rx_fifo);
+	to_read = size < len ? size : len;
 
-	// char *buf = kmalloc(sizeof(*buf) * size, GFP_KERNEL);
-	// if (!buf)
-	// 	return -ENOMEM;
+	kfifo_out_spinlocked(&dev->rx_fifo, buff, to_read, &dev->rx_lock);
 
-	// sau fara buf, cu spin_lock_irqsave, kfifo_to_user,
-	// spin_unlock_irqrestore
+	if (copy_to_user(user_buffer, buff, to_read))
+		return -EFAULT;
 
-	// wait_event_interruptible(dev->tx_wq, ?)
-
-	// kfifo_out_spinlocked(dev->tx_fifo, buf, to_read, dev->tx_lock)
-
-	// copy_to_user(user_buffer, buf, to_read);
-
-	// kfree(buf);
-
-	return 0;
+	*offset += to_read;  // TODO: mai e nevoie? nu-l folosesc
+	return to_read;
 }
 
 static ssize_t uart_write(
@@ -120,38 +119,36 @@ static ssize_t uart_write(
 	const char __user *user_buffer,
 	size_t size,
 	loff_t *offset
-)
-{
+) {
+	int ret;
+	size_t to_write, len;
+	char buff[KFIFO_SIZE];
 	struct com_dev *dev = (struct com_dev *) file->private_data;
 
-	// TODO:
+	ret = wait_event_interruptible(
+		dev->rx_wq,
+		!kfifo_is_full(&dev->tx_fifo)
+	);
+	if (ret)
+		return -EINVAL;  // TODO: alta eroare?
 
-	// alte configurari
+	len = kfifo_len(&dev->tx_fifo);
+	to_write = size < len ? size : len;
 
-	// char *buf = kmalloc(sizeof(*buf) * size, GFP_KERNEL);
-	// if (!buf)
-	// 	return -ENOMEM;
+	if (copy_from_user(buff, user_buffer, to_write))
+		return -EFAULT;
 
-	// sau fara buf, cu spin_lock_irqsave, kfifo_from_user,
-	// spin_unlock_irqrestore
+	kfifo_in_spinlocked(&dev->tx_fifo, buff, to_write, &dev->tx_lock);
 
-	// copy_from_user(buf, user_buffer, to_write);
-
-	// wait_event_interruptible(dev->rx_wq, ?)
-
-	// kfifo_in_spinlocked(dev->rx_fifo, buf, to_write, dev->rx_lock)
-
-	// kfree(buf);
-
-	return 0;
+	*offset += to_write;  // TODO: mai e nevoie? nu-l folosesc
+	return to_write;
 }
 
 static long uart_ioctl(
 	struct file *file,
 	unsigned int cmd,
 	unsigned long arg
-)
-{
+) {
 	int ret = 0;
 	struct uart16550_line_info info;
 	struct com_dev *dev = (struct com_dev *) file->private_data;
