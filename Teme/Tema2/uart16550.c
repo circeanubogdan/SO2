@@ -115,14 +115,14 @@ static ssize_t uart_read(
 	char buff[KFIFO_SIZE];
 	struct com_dev *dev = (struct com_dev *)file->private_data;
 
-	// pr_info("astept sa citesc\n");
+	pr_info("astept sa citesc\n");
 	ret = wait_event_interruptible(
 		dev->tx_wq,
 		!kfifo_is_empty(&dev->tx_fifo)
 	);
 	if (ret)
 		return -EINVAL;  // TODO: alta eroare?
-	// pr_info("am fost trezit sa citesc\n");
+	pr_info("am fost trezit sa citesc\n");
 
 	len = kfifo_len(&dev->tx_fifo);
 	to_read = size < len ? size : len;
@@ -149,7 +149,7 @@ static ssize_t uart_write(
 	loff_t *offset
 ) {
 	int ret;
-	size_t to_write, len;
+	size_t to_write, avail;
 	char buff[KFIFO_SIZE];
 	struct com_dev *dev = (struct com_dev *)file->private_data;
 
@@ -162,8 +162,8 @@ static ssize_t uart_write(
 		return -EINVAL;  // TODO: alta eroare?
 	// pr_info("am fost trezit sa scriu\n");
 
-	len = kfifo_len(&dev->rx_fifo);
-	to_write = size < len ? size : len;
+	avail = kfifo_size(&dev->rx_fifo) - kfifo_len(&dev->rx_fifo);
+	to_write = size < avail ? size : avail;
 
 	if (copy_from_user(buff, user_buffer, to_write))
 		return -EFAULT;
@@ -255,7 +255,7 @@ static irqreturn_t com_interrupt_handler(int irq_no, void *dev_id)
 	case THREI_BITS:
 		// pr_info("THREI\n");
 		byte = inb(RBR(addr[dev->com_no]));
-		kfifo_in_spinlocked(
+		kfifo_in_spinlocked_noirqsave(
 			&dev->tx_fifo,
 			&byte,
 			1,
@@ -333,11 +333,11 @@ static int add_device(enum coms com_no)
 	if (ret)
 		pr_err("cdev_add failed: %d\n", ret);
 
-	/* Enable RDAI and THREI */
-	outb(SET_BIT(SET_BIT(0, RDAI), THREI), IER(addr[com_no]));
-
 	/* Enable interrupts */
 	outb(SET_BIT(0, AO2), MCR(addr[com_no]));
+
+	/* Enable RDAI and THREI */
+	outb(SET_BIT(SET_BIT(0, RDAI), THREI), IER(addr[com_no]));
 
 	return ret;
 }
