@@ -29,14 +29,34 @@
 #define SINGLE_MINOR		1
 #define ALL_MINORS		2
 
-#define KFIFO_SIZE		1024
+#define KFIFO_SIZE		512
 
+#define THR(base_addr)		(base_addr + 0)
+#define RBR(base_addr)		(base_addr + 0)
 #define DLL(base_addr)		(base_addr + 0)
 #define DLH(base_addr)		(base_addr + 1)
+#define IER(base_addr)		(base_addr + 1)
 #define IIR(base_addr)		(base_addr + 2)
 #define LCR(base_addr)		(base_addr + 3)
+#define MCR(base_addr)		(base_addr + 4)
 
-#define DLAB			(1 << 7)
+#define IIR_INT_TYPE(reg)	(reg & 0x0e)
+
+#define IPF			0
+
+#define RDAI			0
+#define THREI			1
+
+#define DLAB			7
+
+#define AO2			3
+
+#define RDAI_BITS		1
+#define THREI_BITS		2
+
+#define GET_BIT(reg, idx)	(reg & (1 << idx))
+#define SET_BIT(reg, idx)	(reg | (1 << idx))
+#define CLEAR_BIT(reg, idx)	(reg & ~(1 << idx))
 
 enum coms {COM1 = 0, COM2};
 
@@ -95,12 +115,16 @@ static ssize_t uart_read(
 	char buff[KFIFO_SIZE];
 	struct com_dev *dev = (struct com_dev *) file->private_data;
 
+	pr_info("Let's wait\n");
+
 	ret = wait_event_interruptible(
 		dev->rx_wq,
 		!kfifo_is_empty_spinlocked(&dev->rx_fifo, &dev->rx_lock)
 	);
 	if (ret)
 		return -EINVAL;  // TODO: alta eroare?
+
+	pr_info("Read up\n");
 
 	len = kfifo_len(&dev->rx_fifo);
 	to_read = size < len ? size : len;
@@ -109,6 +133,12 @@ static ssize_t uart_read(
 
 	if (copy_to_user(user_buffer, buff, to_read))
 		return -EFAULT;
+
+	/* Reenable RDAI */
+	outb(
+		SET_BIT(inb(IER(addr[dev->com_no])), RDAI),
+		IER(addr[dev->com_no])
+	);
 
 	*offset += to_read;  // TODO: mai e nevoie? nu-l folosesc
 	return to_read;
@@ -140,6 +170,12 @@ static ssize_t uart_write(
 
 	kfifo_in_spinlocked(&dev->tx_fifo, buff, to_write, &dev->tx_lock);
 
+	/* Reenable THREI */
+	outb(
+		SET_BIT(inb(IER(addr[dev->com_no])), THREI),
+		IER(addr[dev->com_no])
+	);
+
 	*offset += to_write;  // TODO: mai e nevoie? nu-l folosesc
 	return to_write;
 }
@@ -150,6 +186,7 @@ static long uart_ioctl(
 	unsigned long arg
 ) {
 	int ret = 0;
+	char config;
 	struct uart16550_line_info info;
 	struct com_dev *dev = (struct com_dev *) file->private_data;
 
@@ -164,11 +201,10 @@ static long uart_ioctl(
 		pr_info("Baud: %d, len: %d\n", info.baud, info.len);
 		pr_info("Par: %d, stop: %d\n", info.par, info.stop);
 
+		config = info.par | info.stop | info.len;
+
 		/* LCR = {1b'{dlab}, 1b'{}, 3b'{par}, 1b'{stop}, 2b'{len}} */
-		outb(
-			DLAB | info.par | info.stop | info.len,
-			LCR(addr[dev->com_no])
-		);
+		outb(SET_BIT(config, DLAB), LCR(addr[dev->com_no]));
 
 		/*
 		 * {DLH, DLL} = baud. We set DLH to 0 since `baud` from
@@ -183,12 +219,7 @@ static long uart_ioctl(
 			inb(DLL(addr[dev->com_no]))
 		);
 
-		outb(
-			~DLAB & (info.par | info.stop | info.len),
-			LCR(addr[dev->com_no])
-		);
-
-		// TODO: alte configurari
+		outb(CLEAR_BIT(config, DLAB), LCR(addr[dev->com_no]));
 
 		break;
 
@@ -207,25 +238,68 @@ static const struct file_operations uart_fops = {
 	.unlocked_ioctl = uart_ioctl,
 };
 
-// TODO: https://en.wikibooks.org/wiki/Serial_Programming/8250_UART_Programming
 static irqreturn_t com_interrupt_handler(int irq_no, void *dev_id)
 {
-	// TODO:
-	// verifica IIR
-	// IIR 0 Enable Received Data Available Interrupt
-	// IIR 1 Enable Transmitter Holding Register Empty Interrupt
-	// IIR 2 Enable Receiver Line Status Interrupt
+	struct com_dev *dev = (struct com_dev *) dev_id;
 
-	// alte configurari
+	char iir = inb(IIR(addr[dev->com_no]));
+	char type = IIR_INT_TYPE(iir);
+	char byte;
 
-	// wake_up
+	// if (GET_BIT(iir, IPF))
+	// 	return IRQ_NONE;
 
-	return IRQ_NONE;
+	pr_info("Irq %d, %d\n", irq_no, dev->com_no);
+
+	if (type == RDAI_BITS) {
+		pr_info("RDAI\n");
+		byte = inb(RBR(addr[dev->com_no]));
+		kfifo_in_spinlocked_noirqsave(
+			&dev->rx_fifo,
+			&byte,
+			1,
+			&dev->rx_lock
+		);
+
+		if (kfifo_is_full(&dev->rx_fifo))
+			outb(
+				CLEAR_BIT(inb(IER(addr[dev->com_no])), RDAI),
+				IER(addr[dev->com_no])
+			);
+
+		pr_info("Let's wake up\n");
+
+		wake_up(&dev->rx_wq);
+	}
+
+	if (type == THREI_BITS) {
+		kfifo_out_spinlocked_noirqsave(
+			&dev->tx_fifo,
+			&byte,
+			1,
+			&dev->tx_lock
+		);
+		outb(byte, THR(addr[dev->com_no]));
+
+		if (kfifo_is_empty_spinlocked_noirqsave(
+			&dev->tx_fifo,
+			&dev->tx_lock
+		))
+			outb(
+				CLEAR_BIT(inb(IER(addr[dev->com_no])), THREI),
+				IER(addr[dev->com_no])
+			);
+
+		wake_up(&dev->tx_wq);
+	}
+
+	return IRQ_HANDLED;
 }
 
 static int add_device(enum coms com_no)
 {
 	int ret;
+	char config = 0;
 
 	spin_lock_init(&devs[com_no].rx_lock);
 	init_waitqueue_head(&devs[com_no].rx_wq);
@@ -235,6 +309,13 @@ static int add_device(enum coms com_no)
 
 	devs[com_no].com_no = com_no;
 
+	/* Enable interrupts */
+	outb(SET_BIT(config, AO2), MCR(addr[com_no]));
+
+	/* Enable RDAI and THREI */
+	config = 0;
+	outb(SET_BIT(SET_BIT(config, RDAI), THREI), IER(addr[com_no]));
+
 	cdev_init(&devs[com_no].cdev, &uart_fops);
 	ret = cdev_add(
 		&devs[com_no].cdev,
@@ -243,8 +324,6 @@ static int add_device(enum coms com_no)
 	);
 	if (ret)
 		pr_err("cdev_add failed: %d\n", ret);
-
-	// TODO: alte configurari
 
 	return ret;
 }
@@ -356,6 +435,7 @@ out_init_err:
 	return ret;
 }
 
+// TODO: lungime linii
 static void __exit uart_exit(void)
 {
 	switch (option) {
