@@ -107,8 +107,7 @@ static ssize_t uart_read(
 	struct file *file,
 	char __user *user_buffer,
 	size_t size,
-	loff_t *offset
-)
+	loff_t *offset)
 {
 	int ret;
 	size_t to_read, len;
@@ -153,8 +152,7 @@ static ssize_t uart_write(
 	struct file *file,
 	const char __user *user_buffer,
 	size_t size,
-	loff_t *offset
-)
+	loff_t *offset)
 {
 	int ret;
 	size_t to_write, avail;
@@ -195,11 +193,8 @@ static ssize_t uart_write(
 	return to_write;
 }
 
-static long uart_ioctl(
-	struct file *file,
-	unsigned int cmd,
-	unsigned long arg
-)
+static long
+uart_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	int ret = 0;
 	char config;
