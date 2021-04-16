@@ -108,7 +108,8 @@ static ssize_t uart_read(
 	char __user *user_buffer,
 	size_t size,
 	loff_t *offset
-) {
+)
+{
 	int ret;
 	size_t to_read, len;
 	char buff[KFIFO_SIZE];
@@ -116,7 +117,7 @@ static ssize_t uart_read(
 
 	if (!dev->configed) {
 		pr_err("Device not configured\n");
-		return ret;
+		return -EIO;
 	}
 
 	ret = wait_event_interruptible(
@@ -153,7 +154,8 @@ static ssize_t uart_write(
 	const char __user *user_buffer,
 	size_t size,
 	loff_t *offset
-) {
+)
+{
 	int ret;
 	size_t to_write, avail;
 	char buff[KFIFO_SIZE];
@@ -161,7 +163,7 @@ static ssize_t uart_write(
 
 	if (!dev->configed) {
 		pr_err("Device not configured\n");
-		return ret;
+		return -EIO;
 	}
 
 	ret = wait_event_interruptible(
@@ -197,7 +199,8 @@ static long uart_ioctl(
 	struct file *file,
 	unsigned int cmd,
 	unsigned long arg
-) {
+)
+{
 	int ret = 0;
 	char config;
 	struct uart16550_line_info info;
@@ -243,7 +246,7 @@ static const struct file_operations uart_fops = {
 static irqreturn_t com_interrupt_handler(int irq_no, void *dev_id)
 {
 	char byte;
-	struct com_dev *dev = (struct com_dev *)dev_id;	
+	struct com_dev *dev = (struct com_dev *)dev_id;
 	char iir = inb(IIR(addr[dev->com_no]));
 	char type = IIR_INT_TYPE(iir);
 
