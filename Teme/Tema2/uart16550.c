@@ -18,6 +18,8 @@
 #include <linux/interrupt.h>
 #include <linux/kfifo.h>
 #include <linux/wait.h>
+#include <linux/workqueue.h>
+#include <asm-generic/atomic-long.h>
 
 #include "uart16550.h"
 
@@ -67,6 +69,10 @@
 
 #define MIN(x, y)		((x) < (y) ? (x) : (y))
 
+#define ENABLE_INTR(com, type) \
+	outb(SET_BIT(inb(IER(addr[com])), type), IER(addr[com]))
+#define DISABLE_INTR(com, type) \
+	outb(CLEAR_BIT(inb(IER(addr[com])), type), IER(addr[com]))
 
 enum coms {COM1 = 0, COM2};
 
@@ -80,6 +86,7 @@ static struct com_dev {
 	enum coms com_no;
 	spinlock_t rx_lock, tx_lock;
 	wait_queue_head_t rx_wq, tx_wq;
+	struct work_struct rx_work, tx_work;
 	DECLARE_KFIFO(rx_fifo, char, KFIFO_SIZE);
 	DECLARE_KFIFO(tx_fifo, char, KFIFO_SIZE);
 	bool configed;
@@ -126,7 +133,10 @@ static ssize_t uart_read(
 
 	ret = wait_event_interruptible(
 		dev->rx_wq,
-		!kfifo_is_empty_spinlocked(&dev->rx_fifo, &dev->rx_lock)
+		!kfifo_is_empty_spinlocked_noirqsave(
+			&dev->rx_fifo,
+			&dev->rx_lock
+		)
 	);
 	if (ret) {
 		pr_err("wait_event_interruptible failed for read\n");
@@ -136,7 +146,12 @@ static ssize_t uart_read(
 	len = kfifo_len(&dev->rx_fifo);
 	to_read = MIN(size, len);
 
-	kfifo_out_spinlocked(&dev->rx_fifo, buff, to_read, &dev->rx_lock);
+	kfifo_out_spinlocked_noirqsave(
+		&dev->rx_fifo,
+		buff,
+		to_read,
+		&dev->rx_lock
+	);
 
 	if (copy_to_user(user_buffer, buff, to_read)) {
 		pr_err("Failed to copy data to user\n");
@@ -186,7 +201,12 @@ static ssize_t uart_write(
 		return -EFAULT;
 	}
 
-	kfifo_in_spinlocked(&dev->tx_fifo, buff, to_write, &dev->tx_lock);
+	kfifo_in_spinlocked_noirqsave(
+		&dev->tx_fifo,
+		buff,
+		to_write,
+		&dev->tx_lock
+	);
 
 	/* Kfifo is no longer empty, thus reenable writes. */
 	if (avail == kfifo_size(&dev->tx_fifo))
@@ -243,10 +263,57 @@ static const struct file_operations uart_fops = {
 	.unlocked_ioctl = uart_ioctl,
 };
 
+
+static void rx_handler(struct work_struct *work)
+{
+	char lsr, byte;
+	struct com_dev *dev = container_of(work, struct com_dev, rx_work);
+
+	do {
+		byte = inb(RBR(addr[dev->com_no]));
+		kfifo_in_spinlocked_noirqsave(
+			&dev->rx_fifo,
+			&byte,
+			sizeof(byte),
+			&dev->rx_lock
+		);
+
+		lsr = inb(LSR(addr[dev->com_no]));
+	} while (!kfifo_is_full(&dev->rx_fifo) && GET_BIT(lsr, DR));
+
+	if (!kfifo_is_full(&dev->rx_fifo))
+		ENABLE_INTR(dev->com_no, RDAI);
+
+	wake_up(&dev->rx_wq);
+}
+
+static void tx_handler(struct work_struct *work)
+{
+	char lsr, byte;
+	struct com_dev *dev = container_of(work, struct com_dev, tx_work);
+
+	do {
+		kfifo_out_spinlocked_noirqsave(
+			&dev->tx_fifo,
+			&byte,
+			sizeof(byte),
+			&dev->tx_lock
+		);
+
+		outb(byte, THR(addr[dev->com_no]));
+		lsr = inb(LSR(addr[dev->com_no]));
+	} while (GET_BIT(lsr, ETHR) && GET_BIT(lsr, EDHR)
+		&& !kfifo_is_empty(&dev->tx_fifo)
+	);
+
+	if (!kfifo_is_empty(&dev->tx_fifo))
+		ENABLE_INTR(dev->com_no, THREI);
+
+	wake_up(&dev->tx_wq);
+}
+
 static irqreturn_t com_interrupt_handler(int irq_no, void *dev_id)
 {
-	char byte;
-	char lsr;
 	struct com_dev *dev = (struct com_dev *)dev_id;
 	char iir = inb(IIR(addr[dev->com_no]));
 	char type = IIR_INT_TYPE(iir);
@@ -258,49 +325,28 @@ static irqreturn_t com_interrupt_handler(int irq_no, void *dev_id)
 
 	switch (type) {
 	case RDAI_BITS:
-		do {
-			byte = inb(RBR(addr[dev->com_no]));
-			kfifo_in_spinlocked_noirqsave(
-				&dev->rx_fifo,
-				&byte,
-				sizeof(byte),
-				&dev->rx_lock
-			);
-			lsr = inb(LSR(addr[dev->com_no]));
-		} while (!kfifo_is_full(&dev->rx_fifo) && GET_BIT(lsr, DR));
+		DISABLE_INTR(dev->com_no, RDAI);
 
-		if (kfifo_is_full(&dev->rx_fifo))
-			outb(
-				CLEAR_BIT(inb(IER(addr[dev->com_no])), RDAI),
-				IER(addr[dev->com_no])
-			);
-
-		wake_up(&dev->rx_wq);
+		/*
+		 * Handle the actual reading in a work queue to spend less time
+		 * in the interrupt.
+		 */
+		if (!schedule_work(&dev->rx_work)) {
+			pr_err("Failed to schedule read work queue\n");
+			return IRQ_NONE;
+		}
 		break;
 	case THREI_BITS:
-		do {
-			kfifo_out_spinlocked_noirqsave(
-				&dev->tx_fifo,
-				&byte,
-				sizeof(byte),
-				&dev->tx_lock
-			);
-			outb(byte, THR(addr[dev->com_no]));
-			lsr = inb(LSR(addr[dev->com_no]));
-		} while (GET_BIT(lsr, ETHR)
-			&& GET_BIT(lsr, EDHR)
-			&& !kfifo_is_empty_spinlocked_noirqsave(
-				&dev->tx_fifo,
-				&dev->tx_lock
-			)
-		);
+		DISABLE_INTR(dev->com_no, THREI);
 
-		outb(
-			CLEAR_BIT(inb(IER(addr[dev->com_no])), THREI),
-			IER(addr[dev->com_no])
-		);
-
-		wake_up(&dev->tx_wq);
+		/*
+		 * Handle the actual writing in a work queue to spend less time
+		 * in the interrupt.
+		 */
+		if (!schedule_work(&dev->tx_work)) {
+			pr_err("Failed to schedule write work queue\n");
+			return IRQ_NONE;
+		}
 		break;
 	default:
 		return IRQ_NONE;
@@ -321,6 +367,9 @@ static int add_device(enum coms com_no)
 	spin_lock_init(&devs[com_no].tx_lock);
 	init_waitqueue_head(&devs[com_no].tx_wq);
 	INIT_KFIFO(devs[com_no].tx_fifo);
+
+	INIT_WORK(&devs[com_no].rx_work, rx_handler);
+	INIT_WORK(&devs[com_no].tx_work, tx_handler);
 
 	devs[com_no].com_no = com_no;
 
@@ -385,6 +434,8 @@ static void com_cleanup(enum coms com_no)
 {
 	cdev_del(&devs[com_no].cdev);
 	free_irq(iqr_no[com_no], &devs[com_no]);
+	cancel_work_sync(&devs[com_no].rx_work);
+	cancel_work_sync(&devs[com_no].tx_work);
 	release_region(addr[com_no], REGION_SIZE);
 }
 
