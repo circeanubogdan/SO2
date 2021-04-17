@@ -88,3 +88,13 @@ dealoca memorie, se si contorizeaza memoria alocata, respectiv eliberata.
 Prin apeluri de `ioctl()` din user space pe `/dev/tracer`, se pot adauga sau
 scoate de sub observatie anumite procese. Statisticile colectate prin probele
 de mai sus pot fi vazute citind din `/proc/tracer`.
+
+
+### Tema 2 - Driver UART
+Practic PM 2.0. Se implementeaza un driver care stie sa comunice printr-un
+port serial UART16550. Poate sa comunice fie cu un singur port (`COM1` sau
+`COM2`), fie prin amandoua. Expune operatiile blocante de `read` si `write`,
+iar buffereke interne sunt implementate folosind `kfifo`-uri.
+
+Destul de jegoasa. Multumiri speciale @[Adina](https://github.com/adinasm), care
+s-a ocupat de partea de registre si de frecat datasheetul.
