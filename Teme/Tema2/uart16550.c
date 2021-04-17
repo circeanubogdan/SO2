@@ -41,6 +41,7 @@
 #define IIR(base_addr)		(base_addr + 2)
 #define LCR(base_addr)		(base_addr + 3)
 #define MCR(base_addr)		(base_addr + 4)
+#define LSR(base_addr)		(base_addr + 5)
 
 #define IIR_INT_TYPE(reg)	(reg & 0x0e)
 
@@ -52,6 +53,10 @@
 #define DLAB			7
 
 #define AO2			3
+
+#define DR			0
+#define ETHR			5
+#define EDHR			6
 
 #define THREI_BITS		(1 << 1)
 #define RDAI_BITS		(1 << 2)
@@ -241,6 +246,7 @@ static const struct file_operations uart_fops = {
 static irqreturn_t com_interrupt_handler(int irq_no, void *dev_id)
 {
 	char byte;
+	char lsr;
 	struct com_dev *dev = (struct com_dev *)dev_id;
 	char iir = inb(IIR(addr[dev->com_no]));
 	char type = IIR_INT_TYPE(iir);
@@ -252,13 +258,16 @@ static irqreturn_t com_interrupt_handler(int irq_no, void *dev_id)
 
 	switch (type) {
 	case RDAI_BITS:
-		byte = inb(RBR(addr[dev->com_no]));
-		kfifo_in_spinlocked_noirqsave(
-			&dev->rx_fifo,
-			&byte,
-			sizeof(byte),
-			&dev->rx_lock
-		);
+		do {
+			byte = inb(RBR(addr[dev->com_no]));
+			kfifo_in_spinlocked_noirqsave(
+				&dev->rx_fifo,
+				&byte,
+				sizeof(byte),
+				&dev->rx_lock
+			);
+			lsr = inb(LSR(addr[dev->com_no]));
+		} while (!kfifo_is_full(&dev->rx_fifo) && GET_BIT(lsr, DR));
 
 		if (kfifo_is_full(&dev->rx_fifo))
 			outb(
@@ -269,22 +278,27 @@ static irqreturn_t com_interrupt_handler(int irq_no, void *dev_id)
 		wake_up(&dev->rx_wq);
 		break;
 	case THREI_BITS:
-		kfifo_out_spinlocked_noirqsave(
-			&dev->tx_fifo,
-			&byte,
-			sizeof(byte),
-			&dev->tx_lock
-		);
-		outb(byte, THR(addr[dev->com_no]));
-
-		if (kfifo_is_empty_spinlocked_noirqsave(
-			&dev->tx_fifo,
-			&dev->tx_lock
-		))
-			outb(
-				CLEAR_BIT(inb(IER(addr[dev->com_no])), THREI),
-				IER(addr[dev->com_no])
+		do {
+			kfifo_out_spinlocked_noirqsave(
+				&dev->tx_fifo,
+				&byte,
+				sizeof(byte),
+				&dev->tx_lock
 			);
+			outb(byte, THR(addr[dev->com_no]));
+			lsr = inb(LSR(addr[dev->com_no]));
+		} while (GET_BIT(lsr, ETHR)
+			&& GET_BIT(lsr, EDHR)
+			&& !kfifo_is_empty_spinlocked_noirqsave(
+				&dev->tx_fifo,
+				&dev->tx_lock
+			)
+		);
+
+		outb(
+			CLEAR_BIT(inb(IER(addr[dev->com_no])), THREI),
+			IER(addr[dev->com_no])
+		);
 
 		wake_up(&dev->tx_wq);
 		break;
