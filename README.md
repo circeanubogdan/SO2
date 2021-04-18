@@ -94,7 +94,7 @@ de mai sus pot fi vazute citind din `/proc/tracer`.
 Practic PM 2.0. Se implementeaza un driver care stie sa comunice printr-un
 port serial UART16550. Poate sa comunice fie cu un singur port (`COM1` sau
 `COM2`), fie prin amandoua. Expune operatiile blocante de `read` si `write`,
-iar buffereke interne sunt implementate folosind `kfifo`-uri.
+iar bufferele interne sunt implementate folosind `kfifo`-uri.
 
 Destul de jegoasa. Multumiri speciale @[Adina](https://github.com/adinasm), care
 s-a ocupat de partea de registre si de frecat datasheetul.
