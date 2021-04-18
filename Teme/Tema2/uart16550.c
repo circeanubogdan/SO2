@@ -303,10 +303,12 @@ static void tx_handler(struct work_struct *work)
 		outb(byte, THR(addr[dev->com_no]));
 		lsr = inb(LSR(addr[dev->com_no]));
 	} while (GET_BIT(lsr, ETHR) && GET_BIT(lsr, EDHR)
-		&& !kfifo_is_empty(&dev->tx_fifo)
+		&& !kfifo_is_empty_spinlocked_noirqsave(
+			&dev->tx_fifo,
+			&dev->tx_lock)
 	);
 
-	if (!kfifo_is_empty(&dev->tx_fifo))
+	if (!kfifo_is_empty_spinlocked_noirqsave(&dev->tx_fifo, &dev->tx_lock))
 		ENABLE_INTR(dev->com_no, THREI);
 
 	wake_up(&dev->tx_wq);
