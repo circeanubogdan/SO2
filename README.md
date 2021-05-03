@@ -56,6 +56,12 @@ O relativa continuare a labului trecut, se implementeaza un dispozitiv bloc
 "virtual", care tine datele in *RAM*.
 
 
+### Lab 8, 9 - Sisteme de fisiere
+Labul asta si urmatorul se implementeaza 2 sisteme de fisiere, unul cu (minfs)
+si celalalt fara suport fizic (myfs). La labul 8 se implementeaza doar
+operatiile necesare pentru `mount` si `umount`, iar in labul 9 se implementeaza
+operatiile pentru crearea fisierelor si directoarelor.
+
 
 ## Teme
 ### Tema 0 - API-ul de liste din Kernel
