@@ -168,13 +168,15 @@ static int minfs_readdir(struct file *filp, struct dir_context *ctx)
 	sb = inode->i_sb;
 
 	/* TODO 5: Read data block for directory inode. */
-	bh = sb_bread(sb, MINFS_INODE_BLOCK);
+	bh = sb_bread(sb, mii->data_block);
+	if (!bh)
+		goto out_bad_sb;
 
 	for (; ctx->pos < MINFS_NUM_ENTRIES; ctx->pos++) {
 		/* TODO 5: Data block contains an array of
 		 * "struct minfs_dir_entry". Use `de' for storing.
 		 */
-		de = ((struct minfs_dir_entry *)bh->b_data) + ctx->pos;
+		de = (struct minfs_dir_entry *)bh->b_data + ctx->pos;
 
 		/* TODO 5: Step over empty entries (de->ino == 0). */
 		if (!de->ino)
@@ -222,7 +224,7 @@ static struct minfs_dir_entry *minfs_find_entry(struct dentry *dentry,
 	/* TODO 6: Read parent folder data block (contains dentries).
 	 * Fill bhp with return value.
 	 */
-	bh = sb_bread(dir->i_sb, MINFS_INODE_BLOCK);
+	bh = sb_bread(dir->i_sb, mii->data_block);
 	*bhp = bh;
 
 	for (i = 0; i < MINFS_NUM_ENTRIES; i++) {
@@ -230,8 +232,7 @@ static struct minfs_dir_entry *minfs_find_entry(struct dentry *dentry,
 		 * Use `de' to traverse. Use `final_de' to store dentry
 		 * found, if existing.
 		 */
-		de = ((struct minfs_dir_entry *)bh->b_data) + i;
-
+		de = (struct minfs_dir_entry *)bh->b_data + i;
 		if (!de->ino)
 			continue;
 
@@ -325,8 +326,12 @@ static struct inode *minfs_new_inode(struct inode *dir)
 	 * and insert inode into inode hash table.
 	 */
 	inode = new_inode(sb);
-	inode->i_mode = 0;
 	inode_init_owner(inode, dir, 0);
+	inode->i_ino = idx;
+	inode->i_mtime = inode->i_atime = inode->i_ctime = current_time(inode);
+	inode->i_blocks = 0;
+
+	insert_inode_hash(inode);
 
 	/* Actual writing to the disk will be done in minfs_write_inode,
 	 * which will be called at a later time.
@@ -355,16 +360,13 @@ static int minfs_add_link(struct dentry *dentry, struct inode *inode)
 	sb = dir->i_sb;
 
 	/* TODO 7: Read dir data block (use sb_bread). */
-	bh = sb_bread(dir->i_sb, mii->data_block);
+	bh = sb_bread(sb, mii->data_block);
 
 	/* TODO 7: Find first free dentry (de->ino == 0). */
 	for (i = 0; i < MINFS_NUM_ENTRIES; i++) {
-		de = ((struct minfs_dir_entry *)bh->b_data) + i;
-		if (!de->ino) {
-			inode->i_ino = de->ino;
-			dentry->d_name.name = de->name;
+		de = (struct minfs_dir_entry *)bh->b_data + i;
+		if (!de->ino)
 			break;
-		}
 	}
 
 	if (i == MINFS_NUM_ENTRIES) {
@@ -374,6 +376,8 @@ static int minfs_add_link(struct dentry *dentry, struct inode *inode)
 
 	/* TODO 7: Place new entry in the available slot. Mark buffer_head
 	 * as dirty. */
+	de->ino = inode->i_ino;
+	memcpy(de->name, dentry->d_name.name, sizeof(de->name));
 	mark_buffer_dirty(bh);
 
 out:
