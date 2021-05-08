@@ -18,6 +18,8 @@
 
 #include <linux/workqueue.h>
 
+#include <linux/crc32.h>
+
 #include "ssr.h"
 
 
@@ -30,12 +32,11 @@
 
 
 struct work_info {
-	int devno;
+	int devno;  // TODO: de scos
 	struct bio *bio;
 	struct work_struct work;
 };
 
-// TODO: sa scapam de structura asta cu totu'
 static struct block_device *phys_bdev[NUM_PHYS_DEV];
 
 static char* phys_disk_names[] = {PHYSICAL_DISK1_NAME, PHYSICAL_DISK2_NAME};
@@ -48,7 +49,8 @@ static struct ssr_dev {
 	struct blk_mq_tag_set tag_set;
 } g_dev;
 
-static struct bio *create_bio(struct bio *bio, unsigned int devno)
+
+static struct bio *duplicate_bio(struct bio *bio, unsigned int devno)
 {
 	// TODO: dar bio_clone?
 	struct bio_vec bvec;
@@ -75,24 +77,172 @@ static struct bio *create_bio(struct bio *bio, unsigned int devno)
 	return new_bio;
 }
 
+static struct bio *
+create_one_sector_bio(struct gendisk *bdev, sector_t sector, unsigned int dir)
+{
+	
+	struct page *pg;
+	struct bio *bio = bio_alloc(GFP_NOIO, 1);
+
+	if (!bio) {
+		pr_err("bio_alloc failed\n");
+		return NULL;
+	}
+
+	pg = alloc_page(GFP_NOIO);
+	if (!pg) {
+		pr_err("alloc_page failed\n");
+		goto err_alloc_page;
+	}
+
+	if (!bio_add_page(bio, pg, KERNEL_SECTOR_SIZE, 0)) {
+		pr_err("bio_add_page failed\n");
+		goto err_bio_add_page;
+	}
+
+	bio->bi_disk = bdev;
+	bio->bi_iter.bi_sector = sector;
+	bio->bi_opf = dir;
+
+	// free_page(pg); TODO: pot sa dau free aici? nu cred
+
+	return bio;
+
+err_bio_add_page:
+	free_page((ulong)pg);
+err_alloc_page:
+	bio_put(bio);
+
+	return NULL;
+}
+
+
+static bool copy_sector_data(char *buff, struct page *pg, unsigned int dir)
+{
+	bool ret = true;
+	char *pg_buff = kmap_atomic(pg);
+
+	if (!pg_buff) {
+		pr_err("kmap_atomic failed\n");
+		return false;
+	}
+
+	if (op_is_write(dir))
+		memcpy(pg_buff, buff, KERNEL_SECTOR_SIZE);
+	else if (op_is_sync(dir))
+		memcpy(buff, pg_buff, KERNEL_SECTOR_SIZE);
+	else {
+		pr_err("unknown data direction 0x%X\n", dir);
+		ret = false;
+	}
+
+	kunmap_atomic(pg_buff);
+
+	return ret;
+}
+
+// TODO: merge cu functiile de mai sus?
+static void
+handle_sector(char *buff, sector_t sector, struct gendisk *bdev,
+		unsigned int dir)
+{
+	struct bio *bio = create_one_sector_bio(bdev, sector, dir);
+
+	if (!bio) {
+		pr_err("failed to create read bio\n");
+		return;
+	}
+
+	if (!copy_sector_data(buff, bio->bi_io_vec->bv_page, dir)) {
+		pr_err("failed to copy data to buffer\n");
+		goto err_copy_sector_data;
+	}
+
+	submit_bio_wait(bio);
+
+err_copy_sector_data:
+	bio_put(bio);
+}
+
+static inline void read_sector(char *buff, sector_t sector, struct gendisk *bdev)
+{
+	handle_sector(buff, sector, bdev, REQ_OP_READ);
+}
+
+static inline void write_sector(char *buff, sector_t sector, struct gendisk *bdev)
+{
+	handle_sector(buff, sector, bdev, REQ_OP_WRITE);
+}
+
+static void write_crc(struct bio *bio)
+{
+	u32 crc, i;
+	size_t crc_idx = 0;
+	sector_t crc_sect = 0;
+	sector_t crc_area_start = LOGICAL_DISK_SIZE / KERNEL_SECTOR_SIZE;
+	struct bio_vec bvec;
+	struct bvec_iter it;
+	char *buff, *prev_crc_buff;
+	char *crc_buff = kmalloc(KERNEL_SECTOR_SIZE, GFP_KERNEL);
+
+	if (!crc_buff) {
+		pr_err("kmalloc crc_buff failed\n");
+		return;
+	}
+
+	bio_for_each_segment(bvec, bio, it) {
+		buff = kmap_atomic(bvec.bv_page);
+		if (!buff) {
+			pr_err("kmap_atomic failed\n");
+			continue;
+		}
+
+		for (i = 0; i != bvec.bv_len; i += KERNEL_SECTOR_SIZE) {
+			crc = crc32(0, buff, KERNEL_SECTOR_SIZE);
+			*(u32 *)(crc_buff + crc_idx) = crc;
+
+			crc_idx += sizeof(crc);
+			if (crc_idx == KERNEL_SECTOR_SIZE) {
+				write_sector(crc_buff,
+					crc_area_start + crc_sect,
+					bio->bi_disk);
+				crc_idx = 0;
+				++crc_sect;
+			}
+		}
+
+		kunmap_atomic(buff);
+	}
+
+	if (crc_idx) {
+		prev_crc_buff = kmalloc(KERNEL_SECTOR_SIZE, GFP_KERNEL);
+		if (!prev_crc_buff) {
+			pr_err("kmalloc prev_crc_buff failed\n");
+			goto err_prev_crc_buff;
+		}
+
+		read_sector(prev_crc_buff, crc_idx * sizeof(crc), bio->bi_disk);
+		memcpy(prev_crc_buff, crc_buff, crc_idx * sizeof(crc));
+		write_sector(prev_crc_buff, crc_sect, bio->bi_disk);
+
+		kfree(prev_crc_buff);
+	}
+
+err_prev_crc_buff:
+	kfree(crc_buff);
+}
 
 static void write_bio_with_crc(struct bio *bio)
 {
-	// sector_t sect = bio->bi_iter.bi_sector;
-	// unsigned int num_sect = bio_sectors(bio);
-	// sector_t final_sect = sect + num_sect;
-
-	// for (; sect != final_sect; ++sect) {
-		
-	// }
-
-	struct bio *bio_dev0 = create_bio(bio, 0);
-	struct bio *bio_dev1 = create_bio(bio, 1);
+	struct bio *bio_dev0 = duplicate_bio(bio, 0);
+	struct bio *bio_dev1 = duplicate_bio(bio, 1);
 
 	submit_bio_wait(bio_dev0);
-	submit_bio_wait(bio_dev1);
-
+	write_crc(bio_dev0);
 	bio_put(bio_dev0);
+
+	submit_bio_wait(bio_dev1);
+	write_crc(bio_dev1);
 	bio_put(bio_dev1);
 }
 
@@ -104,8 +254,8 @@ static bool has_valid_crc(struct bio *bio)
 static void read_bio(struct bio *bio)
 {
 	// TODO: (poate) schimba la n dispozitive? merita?
-	struct bio *bio_dev0 = create_bio(bio, 0);
-	struct bio *bio_dev1 = create_bio(bio, 1);
+	struct bio *bio_dev0 = duplicate_bio(bio, 0);
+	struct bio *bio_dev1 = duplicate_bio(bio, 1);
 
 	submit_bio_wait(bio_dev0);
 	submit_bio_wait(bio_dev1);
@@ -119,7 +269,6 @@ static void ssr_work_handler(struct work_struct *work)
 	struct work_info *wi = container_of(work, struct work_info, work);
 	struct bio *bio = wi->bio;
 
-	// pr_info("muncesc ba coaie pe directia %d\n", bio_data_dir(bio));
 	switch (bio_data_dir(bio))
 	{
 	case WRITE:
@@ -134,10 +283,9 @@ static void ssr_work_handler(struct work_struct *work)
 	}
 
 	bio_endio(bio);
-
-// err:
 	kfree(wi);
 }
+
 
 static int ssr_open(struct block_device *bdev, fmode_t mode)
 {
@@ -148,6 +296,7 @@ static void ssr_release(struct gendisk *gd, fmode_t mode)
 {
 }
 
+// TODO: de redenumit in create_work_info
 static struct work_info *create_work_info_same_bio(struct bio *bio)
 {
 	struct work_info *info = kmalloc(sizeof(*info), GFP_KERNEL);
@@ -163,13 +312,14 @@ static struct work_info *create_work_info_same_bio(struct bio *bio)
 	return info;
 }
 
+// TODO: de sters
 static struct work_info *create_work_info(int devno, struct bio *bio)
 {
 	struct work_info *info = create_work_info_same_bio(bio);
 
-	info->bio = create_bio(bio, devno);
+	info->bio = duplicate_bio(bio, devno);
 	if (!info->bio) {
-		pr_err("create_bio failed\n");
+		pr_err("duplicate_bio failed\n");
 		kfree(info);
 		return NULL;
 	}
@@ -304,16 +454,11 @@ static void close_disks(void)
 
 static struct block_device *open_disk(char *name)
 {
-	struct block_device *bdev;
-
-	// TODO scapa de apelul de functie daca te scarbeste
 	/* Get block device in exclusive mode. */
-	bdev = blkdev_get_by_path(
+	return blkdev_get_by_path(
 		name,
 		FMODE_READ | FMODE_WRITE | FMODE_EXCL,
 		THIS_MODULE);
-
-	return bdev;
 }
 
 static int open_disks(void)
