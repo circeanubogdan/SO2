@@ -35,21 +35,139 @@ struct work_info {
 	struct work_struct work;
 };
 
+// TODO: sa scapam de structura asta cu totu'
 static struct ssr_phys_bdev {
 	struct block_device *bdev;
 } phys_bdev[NUM_PHYS_DEV];
+
+static char* phys_disk_names[] = {PHYSICAL_DISK1_NAME, PHYSICAL_DISK2_NAME};
 
 static struct ssr_dev {
 	size_t size;
 	u8 *data;
 	struct request_queue *queue;
 	struct gendisk *gd;
-	struct work_struct work;
 	struct blk_mq_tag_set tag_set;
 } g_dev;
 
+
+static inline void free_bio(struct bio *bio)
+{
+	bio_free_pages(bio);
+	bio_put(bio);
+}
+
+static inline void destroy_work_info(struct work_info *wi)
+{
+	cancel_work_sync(&wi->work);
+	free_bio(wi->bio);
+	kfree(wi);
+}
+
+static struct bio *create_bio(struct bio *bio, unsigned int devno)
+{
+	// TODO: dar bio_clone?
+	struct bio_vec bvec;
+	struct bvec_iter i;
+	struct bio *new_bio = bio_alloc(GFP_NOIO, bio->bi_vcnt);
+
+	if (!new_bio) {
+		pr_err("failed to allocate bio\n");
+		return NULL;
+	}
+
+	if (devno < NUM_PHYS_DEV)
+		new_bio->bi_disk = phys_bdev[devno].bdev->bd_disk;
+
+	new_bio->bi_opf = bio_data_dir(bio);
+	new_bio->bi_iter.bi_sector = bio->bi_iter.bi_sector;
+
+	bio_for_each_segment(bvec, bio, i)
+		// TODO: merge sa iau dimensiunea de altundeva gen bvec?
+		// pr_info("bv_len = %d\n", bvec.bv_len);
+		if (!bio_add_page(new_bio, bvec.bv_page, bvec.bv_len,
+				bvec.bv_offset)) {
+			pr_err("bio_add_page failed\n");
+			free_bio(new_bio);
+			return NULL;
+		}
+
+	return new_bio;
+}
+
+
+static void write_bio_with_crc(struct bio *bio)
+{
+	// sector_t sect = bio->bi_iter.bi_sector;
+	// unsigned int num_sect = bio_sectors(bio);
+	// sector_t final_sect = sect + num_sect;
+
+	// for (; sect != final_sect; ++sect) {
+		
+	// }
+
+	// submit_bio_wait(bio);
+	// bio_put(bio);
+
+	struct bio *bio_dev0 = create_bio(bio, 0);
+	struct bio *bio_dev1 = create_bio(bio, 1);
+
+	// pr_info("uite stau; bio = %p; sector = %lld; num_sect = %u\n",
+	// 	bio, bio->bi_iter.bi_sector, bio_sectors(bio));
+
+	submit_bio_wait(bio_dev0);
+	bio_put(bio_dev0);
+	// pr_info("am terminat bio0\n");
+	submit_bio_wait(bio_dev1);
+	bio_put(bio_dev1);
+	// pr_info("cplm? am terminat ambele bio-uri\n");
+}
+
+static bool has_valid_crc(struct bio *bio)
+{
+	return true;
+}
+
+static void read_bio(struct bio *bio)
+{
+	// TODO: (poate) schimba la n dispozitive? merita?
+	struct bio *bio_dev0 = create_bio(bio, 0);
+	struct bio *bio_dev1 = create_bio(bio, 1);
+
+	// pr_info("uite stau\n");
+
+	submit_bio_wait(bio_dev0);
+	// pr_info("am terminat bio0\n");
+	submit_bio_wait(bio_dev1);
+	// pr_info("cplm? am terminat ambele bio-uri\n");
+
+	bio_put(bio_dev0);
+	bio_put(bio_dev1);
+}
+
 static void ssr_work_handler(struct work_struct *work)
 {
+	struct work_info *wi = container_of(work, struct work_info, work);
+	struct bio *bio = wi->bio;
+
+	// pr_info("muncesc ba coaie pe directia %d\n", bio_data_dir(bio));
+	switch (bio_data_dir(bio))
+	{
+	case WRITE:
+		write_bio_with_crc(bio);
+		break;
+	case READ:
+		read_bio(bio);
+		break;
+	default:
+		pr_err("unkown data directection\n");
+		goto err;
+	}
+
+	bio_endio(bio);
+
+err:
+	destroy_work_info(wi);
 }
 
 static int ssr_open(struct block_device *bdev, fmode_t mode)
@@ -61,13 +179,7 @@ static void ssr_release(struct gendisk *gd, fmode_t mode)
 {
 }
 
-static struct bio *create_bio(struct bio *bio)
-{
-	return bio;
-}
-
-static struct work_info
-*create_work_info(int devno, struct bio *bio)
+static struct work_info *create_work_info_same_bio(struct bio *bio)
 {
 	struct work_info *info = kmalloc(sizeof(*info), GFP_KERNEL);
 	if (!info) {
@@ -75,22 +187,59 @@ static struct work_info
 		return NULL;
 	}
 
+	INIT_WORK(&info->work, ssr_work_handler);
+	info->devno = NUM_PHYS_DEV;
+	info->bio = bio;
+
+	return info;
+}
+
+static struct work_info *create_work_info(int devno, struct bio *bio)
+{
+	struct work_info *info = create_work_info_same_bio(bio);
+
+	info->bio = create_bio(bio, devno);
+	if (!info->bio) {
+		pr_err("create_bio failed\n");
+		kfree(info);
+		return NULL;
+	}
+
 	info->devno = devno;
-	info->bio = create_bio(bio);
 
 	return info;
 }
 
 static blk_qc_t ssr_submit_bio(struct bio *bio)
 {
-	pr_info("Dir: %d\n", bio->bi_opf);
-	if (bio_data_dir(bio) == WRITE)
-		pr_info("Write\n");
-	else if (bio_data_dir(bio) == READ)
-		pr_info("Read\n");
+	// int i;
 
-	// schedule_work(&g_dev.work);
+	// pr_info("Dir: %d\n", bio->bi_opf);
+	// if (bio_data_dir(bio) == WRITE) {
+	// 	// pr_info("Write\n");
+	// 	// for (i = 0; i != NUM_PHYS_DEV; ++i)
+	// 	// 	if(!schedule_work(&create_work_info(i, bio)->work)) {
+	// 	// 		pr_err("schedule_work failed for dev %d\n", i);
+	// 	// 		return BLK_QC_T_NONE;
+	// 	// 	}
+	// 	if(!schedule_work(&create_work_info_same_bio(bio)->work)) {
+	// 		pr_err("schedule_work failed for dev %d\n", i);
+	// 		return BLK_QC_T_NONE;
+	// 	}
+	// } else if (bio_data_dir(bio) == READ) {
+	// 	// pr_info("Read\n");
+	// 	if(!schedule_work(&create_work_info_same_bio(bio)->work)) {
+	// 		pr_err("schedule_work failed for dev %d\n", i);
+	// 		return BLK_QC_T_NONE;
+	// 	}
+	// }
+	if(!schedule_work(&create_work_info_same_bio(bio)->work))
+		pr_err("schedule_work failed\n");
 
+	// TODO: de ce se blocheaza close() daca nu-l inchid aici?
+	bio_endio(bio);
+
+	// TOOD: daca crapa, baga 0
 	return BLK_QC_T_NONE;
 }
 
@@ -118,7 +267,7 @@ static int create_block_device(struct ssr_dev *dev)
 
 	dev->size = LOGICAL_DISK_SECTORS * KERNEL_SECTOR_SIZE;
 	dev->data = vmalloc(dev->size);
-	if (dev->data == NULL) {
+	if (!dev->data) {
 		pr_err("vmalloc: out of memory\n");
 		err = -ENOMEM;
 		goto out_vmalloc;
@@ -169,8 +318,6 @@ static int create_block_device(struct ssr_dev *dev)
 
 	add_disk(dev->gd);
 
-	INIT_WORK(&dev->work, ssr_work_handler);
-
 	return 0;
 
 out_alloc_disk:
@@ -185,8 +332,6 @@ out_vmalloc:
 
 static void delete_block_device(struct ssr_dev *dev)
 {
-	cancel_work_sync(&dev->work);
-
 	if (dev->gd) {
 		del_gendisk(dev->gd);
 		put_disk(dev->gd);
@@ -229,23 +374,21 @@ static struct block_device *open_disk(char *name)
 
 static int open_disks(void)
 {
-	// TODO generalizare?
-	phys_bdev[0].bdev = open_disk(PHYSICAL_DISK1_NAME);
-	if (phys_bdev[0].bdev == NULL) {
-		pr_err("No such device: %s\n", PHYSICAL_DISK1_NAME);
-		return -EINVAL;
-	}
+	int i, j;
 
-	phys_bdev[1].bdev = open_disk(PHYSICAL_DISK2_NAME);
-	if (phys_bdev[1].bdev == NULL) {
-		pr_err("No such device: %s\n", PHYSICAL_DISK2_NAME);
-		goto out_close_disk;
+	for (i = 0; i != NUM_PHYS_DEV; ++i) {
+		phys_bdev[i].bdev = open_disk(phys_disk_names[i]);
+		if (!phys_bdev[i].bdev) {
+			pr_err("No such device: %s\n", phys_disk_names[i]);
+			goto out_close_disks;
+		}
 	}
 
 	return 0;
 
-out_close_disk:
-	close_disk(phys_bdev[0].bdev);
+out_close_disks:
+	for (j = 0; j != i; ++j)
+		close_disk(phys_bdev[j].bdev);
 
 	return -EINVAL;
 }
