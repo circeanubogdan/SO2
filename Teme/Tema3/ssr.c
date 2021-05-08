@@ -36,9 +36,7 @@ struct work_info {
 };
 
 // TODO: sa scapam de structura asta cu totu'
-static struct ssr_phys_bdev {
-	struct block_device *bdev;
-} phys_bdev[NUM_PHYS_DEV];
+static struct block_device *phys_bdev[NUM_PHYS_DEV];
 
 static char* phys_disk_names[] = {PHYSICAL_DISK1_NAME, PHYSICAL_DISK2_NAME};
 
@@ -49,20 +47,6 @@ static struct ssr_dev {
 	struct gendisk *gd;
 	struct blk_mq_tag_set tag_set;
 } g_dev;
-
-
-static inline void free_bio(struct bio *bio)
-{
-	bio_free_pages(bio);
-	bio_put(bio);
-}
-
-static inline void destroy_work_info(struct work_info *wi)
-{
-	cancel_work_sync(&wi->work);
-	free_bio(wi->bio);
-	kfree(wi);
-}
 
 static struct bio *create_bio(struct bio *bio, unsigned int devno)
 {
@@ -76,19 +60,15 @@ static struct bio *create_bio(struct bio *bio, unsigned int devno)
 		return NULL;
 	}
 
-	if (devno < NUM_PHYS_DEV)
-		new_bio->bi_disk = phys_bdev[devno].bdev->bd_disk;
-
-	new_bio->bi_opf = bio_data_dir(bio);
+	new_bio->bi_disk = phys_bdev[devno]->bd_disk;
+	new_bio->bi_opf = bio->bi_opf;
 	new_bio->bi_iter.bi_sector = bio->bi_iter.bi_sector;
 
 	bio_for_each_segment(bvec, bio, i)
-		// TODO: merge sa iau dimensiunea de altundeva gen bvec?
-		// pr_info("bv_len = %d\n", bvec.bv_len);
 		if (!bio_add_page(new_bio, bvec.bv_page, bvec.bv_len,
 				bvec.bv_offset)) {
 			pr_err("bio_add_page failed\n");
-			free_bio(new_bio);
+			bio_put(new_bio);
 			return NULL;
 		}
 
@@ -106,21 +86,14 @@ static void write_bio_with_crc(struct bio *bio)
 		
 	// }
 
-	// submit_bio_wait(bio);
-	// bio_put(bio);
-
 	struct bio *bio_dev0 = create_bio(bio, 0);
 	struct bio *bio_dev1 = create_bio(bio, 1);
 
-	// pr_info("uite stau; bio = %p; sector = %lld; num_sect = %u\n",
-	// 	bio, bio->bi_iter.bi_sector, bio_sectors(bio));
-
 	submit_bio_wait(bio_dev0);
-	bio_put(bio_dev0);
-	// pr_info("am terminat bio0\n");
 	submit_bio_wait(bio_dev1);
+
+	bio_put(bio_dev0);
 	bio_put(bio_dev1);
-	// pr_info("cplm? am terminat ambele bio-uri\n");
 }
 
 static bool has_valid_crc(struct bio *bio)
@@ -134,12 +107,8 @@ static void read_bio(struct bio *bio)
 	struct bio *bio_dev0 = create_bio(bio, 0);
 	struct bio *bio_dev1 = create_bio(bio, 1);
 
-	// pr_info("uite stau\n");
-
 	submit_bio_wait(bio_dev0);
-	// pr_info("am terminat bio0\n");
 	submit_bio_wait(bio_dev1);
-	// pr_info("cplm? am terminat ambele bio-uri\n");
 
 	bio_put(bio_dev0);
 	bio_put(bio_dev1);
@@ -161,13 +130,13 @@ static void ssr_work_handler(struct work_struct *work)
 		break;
 	default:
 		pr_err("unkown data directection\n");
-		goto err;
+		break;
 	}
 
 	bio_endio(bio);
 
-err:
-	destroy_work_info(wi);
+// err:
+	kfree(wi);
 }
 
 static int ssr_open(struct block_device *bdev, fmode_t mode)
@@ -212,34 +181,9 @@ static struct work_info *create_work_info(int devno, struct bio *bio)
 
 static blk_qc_t ssr_submit_bio(struct bio *bio)
 {
-	// int i;
-
-	// pr_info("Dir: %d\n", bio->bi_opf);
-	// if (bio_data_dir(bio) == WRITE) {
-	// 	// pr_info("Write\n");
-	// 	// for (i = 0; i != NUM_PHYS_DEV; ++i)
-	// 	// 	if(!schedule_work(&create_work_info(i, bio)->work)) {
-	// 	// 		pr_err("schedule_work failed for dev %d\n", i);
-	// 	// 		return BLK_QC_T_NONE;
-	// 	// 	}
-	// 	if(!schedule_work(&create_work_info_same_bio(bio)->work)) {
-	// 		pr_err("schedule_work failed for dev %d\n", i);
-	// 		return BLK_QC_T_NONE;
-	// 	}
-	// } else if (bio_data_dir(bio) == READ) {
-	// 	// pr_info("Read\n");
-	// 	if(!schedule_work(&create_work_info_same_bio(bio)->work)) {
-	// 		pr_err("schedule_work failed for dev %d\n", i);
-	// 		return BLK_QC_T_NONE;
-	// 	}
-	// }
 	if(!schedule_work(&create_work_info_same_bio(bio)->work))
 		pr_err("schedule_work failed\n");
 
-	// TODO: de ce se blocheaza close() daca nu-l inchid aici?
-	bio_endio(bio);
-
-	// TOOD: daca crapa, baga 0
 	return BLK_QC_T_NONE;
 }
 
@@ -355,7 +299,7 @@ static void close_disks(void)
 	int i;
 
 	for (i = 0; i < NUM_PHYS_DEV; ++i)
-		close_disk(phys_bdev[i].bdev);
+		close_disk(phys_bdev[i]);
 }
 
 static struct block_device *open_disk(char *name)
@@ -377,8 +321,8 @@ static int open_disks(void)
 	int i, j;
 
 	for (i = 0; i != NUM_PHYS_DEV; ++i) {
-		phys_bdev[i].bdev = open_disk(phys_disk_names[i]);
-		if (!phys_bdev[i].bdev) {
+		phys_bdev[i] = open_disk(phys_disk_names[i]);
+		if (!phys_bdev[i]) {
 			pr_err("No such device: %s\n", phys_disk_names[i]);
 			goto out_close_disks;
 		}
@@ -388,7 +332,7 @@ static int open_disks(void)
 
 out_close_disks:
 	for (j = 0; j != i; ++j)
-		close_disk(phys_bdev[j].bdev);
+		close_disk(phys_bdev[j]);
 
 	return -EINVAL;
 }
