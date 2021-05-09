@@ -68,6 +68,7 @@ static struct bio *duplicate_bio(struct bio *bio, unsigned int devno)
 	new_bio->bi_opf = bio->bi_opf;
 	new_bio->bi_iter.bi_sector = bio->bi_iter.bi_sector;
 
+	// TODO: la nevoie, fa cate un bio cu cate o pagina
 	bio_for_each_segment(bvec, bio, i)
 		if (!bio_add_page(new_bio, bvec.bv_page, bvec.bv_len,
 				bvec.bv_offset)) {
@@ -176,15 +177,13 @@ static inline void write_sector(char *buff, sector_t sector, struct gendisk *bde
 
 static void write_crc(struct bio *bio)
 {
-	bool written = false;
 	u32 crc, i;
-	size_t num_crc_sect = KERNEL_SECTOR_SIZE / sizeof(crc);
-	sector_t crc_sect = bio->bi_iter.bi_sector / num_crc_sect
-		+ LOGICAL_DISK_SECTORS;
-	size_t crc_idx = (bio->bi_iter.bi_sector % num_crc_sect) * sizeof(crc);
+
+	size_t crc_idx;
+	sector_t crc_sect;
 	struct bio_vec bvec;
 	struct bvec_iter it;
-	char *buff, *prev_crc_buff;
+	char *buff;
 	char *crc_buff = kmalloc(PAGE_SIZE, GFP_KERNEL);
 
 	if (!crc_buff) {
@@ -193,81 +192,36 @@ static void write_crc(struct bio *bio)
 	}
 
 	// pr_info("initial: idx = %zu; crc_sect = %lld", crc_idx, crc_sect);
-	read_sector(crc_buff, crc_sect, bio->bi_disk);
-	// pr_info("crc citit:\n");
-	// for (i = 0; i != 64; i += 4)
-	// 	pr_info("0x%X\n", *(u32 *)(crc_buff + i));
 
 	bio_for_each_segment(bvec, bio, it) {
 		// pr_err("write_crc bl_len %d, bv_off %d\n", bvec.bv_len, bvec.bv_offset);
+		crc_sect = LOGICAL_DISK_SECTORS
+			+ it.bi_sector * sizeof(crc) / KERNEL_SECTOR_SIZE;
+		crc_idx = it.bi_sector * sizeof(crc) % KERNEL_SECTOR_SIZE;
+		read_sector(crc_buff, crc_sect, bio->bi_disk);
+
 		buff = kmap_atomic(bvec.bv_page);
 		if (!buff) {
 			pr_err("kmap_atomic failed\n");
 			continue;
 		}
-		// pr_info("Bio sector %lld; len = %u\n", it.bi_sector, bvec.bv_len);
 
-		for (i = 0; i != bvec.bv_len; i += KERNEL_SECTOR_SIZE) {
+		// pr_info("sector = %lld; len = %u; idx = %zu\n",
+			// it.bi_sector, bvec.bv_len, crc_idx);
+
+		for (i = 0; i != bvec.bv_len; i += KERNEL_SECTOR_SIZE,
+				crc_idx += sizeof(crc)) {
 			crc = crc32(0, buff + i, KERNEL_SECTOR_SIZE);
 			// pr_info("0x%X\n", crc);
 			*(u32 *)(crc_buff + crc_idx) = crc;
-
-			crc_idx += sizeof(crc);
-			if (crc_idx == PAGE_SIZE) {
-				// pr_info("Write sector: %lld\n", crc_sect);
-				write_sector(crc_buff,
-					crc_sect,
-					bio->bi_disk);
-
-				crc_idx = 0;
-				++crc_sect;
-				written = true;
-			}
 		}
 
 		kunmap_atomic(buff);
-	}
 
-	if (crc_idx) {
-		if (written) {
-			prev_crc_buff = kmalloc(PAGE_SIZE, GFP_KERNEL);
-			if (!prev_crc_buff) {
-				pr_err("kmalloc prev_crc_buff failed\n");
-				goto err_prev_crc_buff;
-			}
-
-			read_sector(prev_crc_buff, crc_sect, bio->bi_disk);
-			// for (i = 0; i != 32; i += 4)
-			// 	pr_info("0x%X 0x%X 0x%X 0x%X",
-			// 		*(int *)(prev_crc_buff + i),
-			// 		*(int *)(prev_crc_buff + i + 1),
-			// 		*(int *)(prev_crc_buff + i + 2),
-			// 		*(int *)(prev_crc_buff + i + 3));
-			memcpy(prev_crc_buff, crc_buff, crc_idx);
-			// // pr_info("prev_crc:\n");
-			// for (i = 0; i != 32; i += 4)
-			// 	pr_info("0x%X 0x%X 0x%X 0x%X",
-			// 		*(int *)(prev_crc_buff + i),
-			// 		*(int *)(prev_crc_buff + i + 1),
-			// 		*(int *)(prev_crc_buff + i + 2),
-			// 		*(int *)(prev_crc_buff + i + 3));
-			// pr_info("crc:\n");
-			// for (i = 0; i != 32; i += 4)
-			// 	pr_info("0x%X 0x%X 0x%X 0x%X",
-			// 		*(int *)(crc_buff + i),
-			// 		*(int *)(crc_buff + i + 1),
-			// 		*(int *)(crc_buff + i + 2),
-			// 		*(int *)(crc_buff + i + 3));
-			// pr_info("Write final sector: %lld to idx %d\n", crc_sect, crc_idx);
-			write_sector(prev_crc_buff, crc_sect, bio->bi_disk);
-
-			kfree(prev_crc_buff);
-		} else {
-			// pr_info("crc scris:\n");
-			// for (i = 0; i != 64; i += 4)
-				// pr_info("0x%X\n", *(u32 *)(crc_buff + i));
-			write_sector(crc_buff, crc_sect, bio->bi_disk);	
-		}
+		// pr_info("crc citit:\n");
+		// for (i = 0; i != 64; i += 4)
+		// 	pr_info("0x%X\n", *(u32 *)(crc_buff + i));
+		write_sector(crc_buff, crc_sect, bio->bi_disk);
 	}
 		
 
@@ -278,37 +232,145 @@ err_prev_crc_buff:
 static void write_bio_with_crc(struct bio *bio)
 {
 	struct bio *bio_dev0 = duplicate_bio(bio, 0);
+	// struct bio *bio_dev01 = duplicate_bio(bio, 0);
 	struct bio *bio_dev1 = duplicate_bio(bio, 1);
+	// struct bio *bio_dev11 = duplicate_bio(bio, 1);
 
 	mutex_lock(&lock_dev0);
 	write_crc(bio_dev0);
 	mutex_unlock(&lock_dev0);
+	// bio_put(bio_dev01);
 	submit_bio_wait(bio_dev0);
 	bio_put(bio_dev0);
 
 	mutex_lock(&lock_dev1);
 	write_crc(bio_dev1);
 	mutex_unlock(&lock_dev1);
+	// bio_put(bio_dev11);
 	submit_bio_wait(bio_dev1);
 	bio_put(bio_dev1);
+}
+
+static inline void
+read_page_both_disks(char *buff_dev0, char *buff_dev1, sector_t sector)
+{
+	read_sector(buff_dev0, sector, phys_bdev[0]->bd_disk);
+	read_sector(buff_dev1, sector, phys_bdev[1]->bd_disk);
 }
 
 static bool has_valid_crc(struct bio *bio)
 {
-	return true;
+	bool ret = true;
+	u32 crc_dev0, crc_dev1, stored_crc_dev0, stored_crc_dev1;
+	sector_t sec = bio->bi_iter.bi_sector, end_sec = bio_end_sector(bio);
+	// size_t num_crc_sect = KERNEL_SECTOR_SIZE / sizeof(crc_dev0);
+	size_t crc_per_sect = KERNEL_SECTOR_SIZE / sizeof(crc_dev0);
+	// sector_t crc_sect = sec / num_crc_sect + LOGICAL_DISK_SECTORS; // sectorul la care incepe pagina cu crc-uri
+	// size_t crc_idx = (sec % num_crc_sect) * sizeof(crc_dev0);  // index in crc_buff (pagina)
+	size_t crc_idx = sizeof(crc_dev0) * sec % KERNEL_SECTOR_SIZE;
+
+	/*
+	sec = 32
+	offset = 4 * 32 octeti
+	[ | | | ][ | | | ][ | | | ][ | | | ][ | | | ][ | | | ][ | | | ]
+	*/
+
+	sector_t crc_sect = LOGICAL_DISK_SECTORS + sizeof(crc_dev0) * sec / KERNEL_SECTOR_SIZE;
+	char *buff_dev0, *buff_dev1, *crc_buff_dev0, *crc_buff_dev1;
+
+	buff_dev0 = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!buff_dev0) {
+		pr_err("kmalloc buffer dev0 failed\n");
+		return false;
+	}
+
+	buff_dev1 = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!buff_dev1) {
+		pr_err("kmalloc buffer dev1 failed\n");
+		ret = false;
+		goto err_buff_dev1;
+	}
+
+	crc_buff_dev0 = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!crc_buff_dev0) {
+		pr_err("kmalloc crc buffer dev0 failed\n");
+		ret = false;
+		goto err_crc_buff_dev0;
+	}
+
+	crc_buff_dev1 = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!crc_buff_dev1) {
+		pr_err("kmalloc crc buffer dev1 failed\n");
+		ret = false;
+		goto err_crc_buff_dev1;
+	}
+
+	// pr_info("res = %lld", sizeof(crc_dev0) * sec);
+
+	if (crc_idx)
+		read_page_both_disks(crc_buff_dev0, crc_buff_dev1, crc_sect++);
+
+	// TODO: cam urat
+	for (; sec != end_sec; ++sec) {
+		read_page_both_disks(buff_dev0, buff_dev1, sec);
+		if (!crc_idx)
+			read_page_both_disks(crc_buff_dev0, crc_buff_dev1,
+				crc_sect++);
+
+		// pr_info("sec = %lld;; crc_sect = %lld; crc_idx = %zu",
+		// 	sec, crc_sect, crc_idx);
+
+		crc_dev0 = crc32(0, buff_dev0, KERNEL_SECTOR_SIZE);
+		crc_dev1 = crc32(0, buff_dev1, KERNEL_SECTOR_SIZE);
+
+		stored_crc_dev0 = *(u32 *)(crc_buff_dev0 + crc_idx);
+		stored_crc_dev1 = *(u32 *)(crc_buff_dev1 + crc_idx);
+
+		// pr_info("dev0: stored = 0x%X; calc = 0x%X\n", stored_crc_dev0, crc_dev0);
+		// pr_info("dev1: stored = 0x%X; calc = 0x%X\n", stored_crc_dev1, crc_dev1);
+
+		if (crc_dev0 != stored_crc_dev0
+				&& crc_dev1 != stored_crc_dev1) {
+			ret = false;
+			// pr_info("ambele bulite la sector %lld\n", sec);
+			// break;
+		} else if (crc_dev0 != stored_crc_dev0) {
+			// pr_info("dev0 bulit la sector %lld\n", sec);
+			// TODO: corecteaza dev 0
+		} else if (crc_dev1 != stored_crc_dev1) {
+			// TODO: corecteaza dev 1
+			// pr_info("dev1 bulit la sector %lld\n", sec);
+		}
+
+		crc_idx = (crc_idx + sizeof(crc_dev0)) % KERNEL_SECTOR_SIZE;
+	}
+
+	kfree(crc_buff_dev1);
+
+err_crc_buff_dev1:
+	kfree(crc_buff_dev0);
+err_crc_buff_dev0:
+	kfree(buff_dev1);
+err_buff_dev1:
+	kfree(buff_dev0);
+
+	return ret;
 }
 
 static void read_bio(struct bio *bio)
 {
-	// TODO: (poate) schimba la n dispozitive? merita?
-	struct bio *bio_dev0 = duplicate_bio(bio, 0);
-	struct bio *bio_dev1 = duplicate_bio(bio, 1);
+	struct bio *bio_copy;
 
-	submit_bio_wait(bio_dev0);
-	submit_bio_wait(bio_dev1);
+	// if (!has_valid_crc(bio)) {
+	// 	// bio_io_error(bio);
+	// 	// return;
+	// 	// pr_info("nu e bune\n");
+	// }
 
-	bio_put(bio_dev0);
-	bio_put(bio_dev1);
+	// TODO: incearca direct cu bio
+	bio_copy = duplicate_bio(bio, 0);
+	submit_bio_wait(bio_copy);
+	bio_put(bio_copy);
 }
 
 static void ssr_work_handler(struct work_struct *work)
@@ -329,6 +391,7 @@ static void ssr_work_handler(struct work_struct *work)
 		break;
 	}
 
+	// TODO: crapa daca dau bio_io_error()?
 	bio_endio(bio);
 	kfree(wi);
 }
