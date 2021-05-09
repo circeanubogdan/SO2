@@ -38,8 +38,10 @@ struct work_info {
 };
 
 static struct block_device *phys_bdev[NUM_PHYS_DEV];
-
 static char* phys_disk_names[] = {PHYSICAL_DISK1_NAME, PHYSICAL_DISK2_NAME};
+
+static DEFINE_MUTEX(lock_dev0);
+static DEFINE_MUTEX(lock_dev1);
 
 static struct ssr_dev {
 	size_t size;
@@ -80,7 +82,6 @@ static struct bio *duplicate_bio(struct bio *bio, unsigned int devno)
 static struct bio *
 create_one_sector_bio(struct gendisk *bdev, sector_t sector, unsigned int dir)
 {
-	
 	struct page *pg;
 	struct bio *bio = bio_alloc(GFP_NOIO, 1);
 
@@ -95,7 +96,7 @@ create_one_sector_bio(struct gendisk *bdev, sector_t sector, unsigned int dir)
 		goto err_alloc_page;
 	}
 
-	if (!bio_add_page(bio, pg, KERNEL_SECTOR_SIZE, 0)) {
+	if (!bio_add_page(bio, pg, PAGE_SIZE, 0)) {
 		pr_err("bio_add_page failed\n");
 		goto err_bio_add_page;
 	}
@@ -103,8 +104,6 @@ create_one_sector_bio(struct gendisk *bdev, sector_t sector, unsigned int dir)
 	bio->bi_disk = bdev;
 	bio->bi_iter.bi_sector = sector;
 	bio->bi_opf = dir;
-
-	// free_page(pg); TODO: pot sa dau free aici? nu cred
 
 	return bio;
 
@@ -127,10 +126,10 @@ static bool copy_sector_data(char *buff, struct page *pg, unsigned int dir)
 		return false;
 	}
 
-	if (op_is_write(dir))
-		memcpy(pg_buff, buff, KERNEL_SECTOR_SIZE);
-	else if (op_is_sync(dir))
-		memcpy(buff, pg_buff, KERNEL_SECTOR_SIZE);
+	if (dir == WRITE)
+		memcpy(pg_buff, buff, PAGE_SIZE);
+	else if (dir == READ)
+		memcpy(buff, pg_buff, PAGE_SIZE);
 	else {
 		pr_err("unknown data direction 0x%X\n", dir);
 		ret = false;
@@ -161,53 +160,68 @@ handle_sector(char *buff, sector_t sector, struct gendisk *bdev,
 	submit_bio_wait(bio);
 
 err_copy_sector_data:
+	__free_page(bio->bi_io_vec->bv_page);
 	bio_put(bio);
 }
 
 static inline void read_sector(char *buff, sector_t sector, struct gendisk *bdev)
 {
-	handle_sector(buff, sector, bdev, REQ_OP_READ);
+	handle_sector(buff, sector, bdev, READ);
 }
 
 static inline void write_sector(char *buff, sector_t sector, struct gendisk *bdev)
 {
-	handle_sector(buff, sector, bdev, REQ_OP_WRITE);
+	handle_sector(buff, sector, bdev, WRITE);
 }
 
 static void write_crc(struct bio *bio)
 {
+	bool written = false;
 	u32 crc, i;
-	size_t crc_idx = 0;
-	sector_t crc_sect = 0;
-	sector_t crc_area_start = LOGICAL_DISK_SIZE / KERNEL_SECTOR_SIZE;
+	size_t num_crc_sect = KERNEL_SECTOR_SIZE / sizeof(crc);
+	sector_t crc_sect = bio->bi_iter.bi_sector / num_crc_sect
+		+ LOGICAL_DISK_SECTORS;
+	size_t crc_idx = (bio->bi_iter.bi_sector % num_crc_sect) * sizeof(crc);
 	struct bio_vec bvec;
 	struct bvec_iter it;
 	char *buff, *prev_crc_buff;
-	char *crc_buff = kmalloc(KERNEL_SECTOR_SIZE, GFP_KERNEL);
+	char *crc_buff = kmalloc(PAGE_SIZE, GFP_KERNEL);
 
 	if (!crc_buff) {
 		pr_err("kmalloc crc_buff failed\n");
 		return;
 	}
 
+	// pr_info("initial: idx = %zu; crc_sect = %lld", crc_idx, crc_sect);
+	read_sector(crc_buff, crc_sect, bio->bi_disk);
+	// pr_info("crc citit:\n");
+	// for (i = 0; i != 64; i += 4)
+	// 	pr_info("0x%X\n", *(u32 *)(crc_buff + i));
+
 	bio_for_each_segment(bvec, bio, it) {
+		// pr_err("write_crc bl_len %d, bv_off %d\n", bvec.bv_len, bvec.bv_offset);
 		buff = kmap_atomic(bvec.bv_page);
 		if (!buff) {
 			pr_err("kmap_atomic failed\n");
 			continue;
 		}
+		// pr_info("Bio sector %lld; len = %u\n", it.bi_sector, bvec.bv_len);
 
 		for (i = 0; i != bvec.bv_len; i += KERNEL_SECTOR_SIZE) {
-			crc = crc32(0, buff, KERNEL_SECTOR_SIZE);
+			crc = crc32(0, buff + i, KERNEL_SECTOR_SIZE);
+			// pr_info("0x%X\n", crc);
 			*(u32 *)(crc_buff + crc_idx) = crc;
 
 			crc_idx += sizeof(crc);
-			if (crc_idx == KERNEL_SECTOR_SIZE) {
+			if (crc_idx == PAGE_SIZE) {
+				// pr_info("Write sector: %lld\n", crc_sect);
 				write_sector(crc_buff,
-					crc_area_start + crc_sect,
+					crc_sect,
 					bio->bi_disk);
+
 				crc_idx = 0;
 				++crc_sect;
+				written = true;
 			}
 		}
 
@@ -215,18 +229,47 @@ static void write_crc(struct bio *bio)
 	}
 
 	if (crc_idx) {
-		prev_crc_buff = kmalloc(KERNEL_SECTOR_SIZE, GFP_KERNEL);
-		if (!prev_crc_buff) {
-			pr_err("kmalloc prev_crc_buff failed\n");
-			goto err_prev_crc_buff;
+		if (written) {
+			prev_crc_buff = kmalloc(PAGE_SIZE, GFP_KERNEL);
+			if (!prev_crc_buff) {
+				pr_err("kmalloc prev_crc_buff failed\n");
+				goto err_prev_crc_buff;
+			}
+
+			read_sector(prev_crc_buff, crc_sect, bio->bi_disk);
+			// for (i = 0; i != 32; i += 4)
+			// 	pr_info("0x%X 0x%X 0x%X 0x%X",
+			// 		*(int *)(prev_crc_buff + i),
+			// 		*(int *)(prev_crc_buff + i + 1),
+			// 		*(int *)(prev_crc_buff + i + 2),
+			// 		*(int *)(prev_crc_buff + i + 3));
+			memcpy(prev_crc_buff, crc_buff, crc_idx);
+			// // pr_info("prev_crc:\n");
+			// for (i = 0; i != 32; i += 4)
+			// 	pr_info("0x%X 0x%X 0x%X 0x%X",
+			// 		*(int *)(prev_crc_buff + i),
+			// 		*(int *)(prev_crc_buff + i + 1),
+			// 		*(int *)(prev_crc_buff + i + 2),
+			// 		*(int *)(prev_crc_buff + i + 3));
+			// pr_info("crc:\n");
+			// for (i = 0; i != 32; i += 4)
+			// 	pr_info("0x%X 0x%X 0x%X 0x%X",
+			// 		*(int *)(crc_buff + i),
+			// 		*(int *)(crc_buff + i + 1),
+			// 		*(int *)(crc_buff + i + 2),
+			// 		*(int *)(crc_buff + i + 3));
+			// pr_info("Write final sector: %lld to idx %d\n", crc_sect, crc_idx);
+			write_sector(prev_crc_buff, crc_sect, bio->bi_disk);
+
+			kfree(prev_crc_buff);
+		} else {
+			// pr_info("crc scris:\n");
+			// for (i = 0; i != 64; i += 4)
+				// pr_info("0x%X\n", *(u32 *)(crc_buff + i));
+			write_sector(crc_buff, crc_sect, bio->bi_disk);	
 		}
-
-		read_sector(prev_crc_buff, crc_idx * sizeof(crc), bio->bi_disk);
-		memcpy(prev_crc_buff, crc_buff, crc_idx * sizeof(crc));
-		write_sector(prev_crc_buff, crc_sect, bio->bi_disk);
-
-		kfree(prev_crc_buff);
 	}
+		
 
 err_prev_crc_buff:
 	kfree(crc_buff);
@@ -237,12 +280,16 @@ static void write_bio_with_crc(struct bio *bio)
 	struct bio *bio_dev0 = duplicate_bio(bio, 0);
 	struct bio *bio_dev1 = duplicate_bio(bio, 1);
 
-	submit_bio_wait(bio_dev0);
+	mutex_lock(&lock_dev0);
 	write_crc(bio_dev0);
+	mutex_unlock(&lock_dev0);
+	submit_bio_wait(bio_dev0);
 	bio_put(bio_dev0);
 
-	submit_bio_wait(bio_dev1);
+	mutex_lock(&lock_dev1);
 	write_crc(bio_dev1);
+	mutex_unlock(&lock_dev1);
+	submit_bio_wait(bio_dev1);
 	bio_put(bio_dev1);
 }
 
