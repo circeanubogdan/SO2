@@ -30,6 +30,9 @@
 #define QUEUE_DEPTH		128
 #define CMD_SIZE		0
 
+#define PHYS_DISK1_IDX		0
+#define PHYS_DISK2_IDX		1
+
 
 struct work_info {
 	struct bio *bio;
@@ -219,11 +222,11 @@ static bool write_bio_with_crc(struct bio *bio)
 {
 	struct bio *bio_dev0, *bio_dev1;
 
-	bio_dev0 = duplicate_bio(bio, 0);
+	bio_dev0 = duplicate_bio(bio, PHYS_DISK1_IDX);
 	if (!bio_dev0)
 		return false;
 
-	bio_dev1 = duplicate_bio(bio, 1);
+	bio_dev1 = duplicate_bio(bio, PHYS_DISK2_IDX);
 	if (!bio_dev1) {
 		bio_put(bio_dev0);
 		return false;
@@ -248,8 +251,8 @@ static bool write_bio_with_crc(struct bio *bio)
 static inline void
 read_sector_both_disks(char *buff_dev0, char *buff_dev1, sector_t sector)
 {
-	read_sector(buff_dev0, sector, phys_bdev[0]->bd_disk);
-	read_sector(buff_dev1, sector, phys_bdev[1]->bd_disk);
+	read_sector(buff_dev0, sector, phys_bdev[PHYS_DISK1_IDX]->bd_disk);
+	read_sector(buff_dev1, sector, phys_bdev[PHYS_DISK2_IDX]->bd_disk);
 }
 
 static inline void
@@ -257,10 +260,12 @@ write_dirty_crc_sectors(char *crc_buff_dev0, char *crc_buff_dev1,
 		bool dirty_crc_dev0, bool dirty_crc_dev1, sector_t sector)
 {
 	if (dirty_crc_dev0)
-		write_sector(crc_buff_dev0, sector, phys_bdev[0]->bd_disk);
+		write_sector(crc_buff_dev0, sector,
+			phys_bdev[PHYS_DISK1_IDX]->bd_disk);
 
 	if (dirty_crc_dev1)
-		write_sector(crc_buff_dev1, sector, phys_bdev[1]->bd_disk);
+		write_sector(crc_buff_dev1, sector,
+			phys_bdev[PHYS_DISK2_IDX]->bd_disk);
 }
 
 static bool has_valid_crc(struct bio *bio)
@@ -291,7 +296,8 @@ static bool has_valid_crc(struct bio *bio)
 		goto err_crc_buff_dev1;
 
 	if (crc_idx)
-		read_sector_both_disks(crc_buff_dev0, crc_buff_dev1, crc_sect++);
+		read_sector_both_disks(crc_buff_dev0, crc_buff_dev1,
+			crc_sect++);
 
 	for (; sec != end_sec; ++sec) {
 		read_sector_both_disks(buff_dev0, buff_dev1, sec);
@@ -317,11 +323,13 @@ static bool has_valid_crc(struct bio *bio)
 		} else if (crc_dev0 != stored_crc_dev0) {
 			dirty_crc_dev0 = true;
 			*(u32 *)(crc_buff_dev0 + crc_idx) = stored_crc_dev1;
-			write_sector(buff_dev1, sec, phys_bdev[0]->bd_disk);
+			write_sector(buff_dev1, sec,
+				phys_bdev[PHYS_DISK1_IDX]->bd_disk);
 		} else if (crc_dev1 != stored_crc_dev1) {
 			dirty_crc_dev1 = true;
 			*(u32 *)(crc_buff_dev1 + crc_idx) = stored_crc_dev0;
-			write_sector(buff_dev0, sec, phys_bdev[1]->bd_disk);
+			write_sector(buff_dev0, sec,
+				phys_bdev[PHYS_DISK2_IDX]->bd_disk);
 		}
 
 		crc_idx = (crc_idx + sizeof(crc_dev0)) % KERNEL_SECTOR_SIZE;
@@ -351,7 +359,7 @@ static bool read_bio(struct bio *bio)
 	if (!has_valid_crc(bio))
 		return false;
 
-	bio_copy = duplicate_bio(bio, 0);
+	bio_copy = duplicate_bio(bio, PHYS_DISK1_IDX);
 	if (!bio_copy)
 		return false;
 
