@@ -104,3 +104,15 @@ iar bufferele interne sunt implementate folosind `kfifo`-uri.
 
 Destul de jegoasa. Multumiri speciale @[Adina](https://github.com/adinasm), care
 s-a ocupat de partea de registre si de frecat datasheetul.
+
+### Tema 3 - RAID Software
+Se implementeaza schema de replicare *RAID 1* intre 2 discuri fizice. Fiecarui
+sector de 512 octeti dintr-un disc i se calculeaza un *CRC* care este scris
+intr-o zona de la finalul discului. Scrierile recalculeaza si rescriu
+*CRC*-urile pe ambele discuri, iar citirile verifica *CRC*-urile sectoarelor
+citite, iar in cazul in care unul dintre acestea (de pe oricare disc) e gresit,
+se inlocuieste cu cel de pe celalalt disc. Daca ambele *CRC*-uri sunt sunt
+gresite, atunci se semnaleaza o eroare de *I/O* folosind `bio_io_error()`.
+
+Da, se folosesc `bio`-uri... :(. Foarte obscure structuri si prost documentate,
+atat in lab, cat si pe net.
