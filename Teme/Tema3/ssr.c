@@ -117,32 +117,32 @@ err_alloc_page:
 }
 
 
-static bool copy_sector_data(char *buff, struct page *pg, unsigned int dir)
+static bool copy_sector_data(char *buf, struct page *pg, unsigned int dir)
 {
 	bool ret = true;
-	char *pg_buff = kmap_atomic(pg);
+	char *pg_buf = kmap_atomic(pg);
 
-	if (!pg_buff) {
+	if (!pg_buf) {
 		pr_err("kmap_atomic failed\n");
 		return false;
 	}
 
 	if (dir == WRITE)
-		memcpy(pg_buff, buff, KERNEL_SECTOR_SIZE);
+		memcpy(pg_buf, buf, KERNEL_SECTOR_SIZE);
 	else if (dir == READ)
-		memcpy(buff, pg_buff, KERNEL_SECTOR_SIZE);
+		memcpy(buf, pg_buf, KERNEL_SECTOR_SIZE);
 	else {
 		pr_err("unknown data direction 0x%X\n", dir);
 		ret = false;
 	}
 
-	kunmap_atomic(pg_buff);
+	kunmap_atomic(pg_buf);
 
 	return ret;
 }
 
 static void
-handle_sector(char *buff, sector_t sector, struct gendisk *bdev,
+handle_sector(char *buf, sector_t sector, struct gendisk *bdev,
 		unsigned int dir)
 {
 	struct bio *bio = create_one_sector_bio(bdev, sector, dir);
@@ -155,7 +155,7 @@ handle_sector(char *buff, sector_t sector, struct gendisk *bdev,
 	if (dir == READ)
 		submit_bio_wait(bio);
 
-	if (!copy_sector_data(buff, bio->bi_io_vec->bv_page, dir)) {
+	if (!copy_sector_data(buf, bio->bi_io_vec->bv_page, dir)) {
 		pr_err("failed to copy data to buffer\n");
 		goto err_copy_sector_data;
 	}
@@ -168,14 +168,14 @@ err_copy_sector_data:
 	bio_put(bio);
 }
 
-static inline void read_sector(char *buff, sector_t sect, struct gendisk *bdev)
+static inline void read_sector(char *buf, sector_t sect, struct gendisk *bdev)
 {
-	handle_sector(buff, sect, bdev, READ);
+	handle_sector(buf, sect, bdev, READ);
 }
 
-static inline void write_sector(char *buff, sector_t sect, struct gendisk *bdev)
+static inline void write_sector(char *buf, sector_t sect, struct gendisk *bdev)
 {
-	handle_sector(buff, sect, bdev, WRITE);
+	handle_sector(buf, sect, bdev, WRITE);
 }
 
 
@@ -186,36 +186,36 @@ static void write_crc(struct bio *bio)
 	sector_t crc_sect;
 	struct bio_vec bvec;
 	struct bvec_iter it;
-	char *buff;
-	char *crc_buff = kmalloc(KERNEL_SECTOR_SIZE, GFP_KERNEL);
+	char *buf;
+	char *crc_buf = kmalloc(KERNEL_SECTOR_SIZE, GFP_KERNEL);
 
-	if (!crc_buff)
+	if (!crc_buf)
 		return;
 
 	bio_for_each_segment(bvec, bio, it) {
 		crc_sect = LOGICAL_DISK_SECTORS
 			+ it.bi_sector * sizeof(crc) / KERNEL_SECTOR_SIZE;
 		crc_idx = it.bi_sector * sizeof(crc) % KERNEL_SECTOR_SIZE;
-		read_sector(crc_buff, crc_sect, bio->bi_disk);
+		read_sector(crc_buf, crc_sect, bio->bi_disk);
 
-		buff = kmap_atomic(bvec.bv_page);
-		if (!buff) {
+		buf = kmap_atomic(bvec.bv_page);
+		if (!buf) {
 			pr_err("kmap_atomic failed\n");
 			continue;
 		}
 
 		for (i = 0; i != bvec.bv_len; i += KERNEL_SECTOR_SIZE,
 				crc_idx += sizeof(crc)) {
-			crc = crc32(0, buff + i, KERNEL_SECTOR_SIZE);
-			*(u32 *)(crc_buff + crc_idx) = crc;
+			crc = crc32(0, buf + i, KERNEL_SECTOR_SIZE);
+			*(u32 *)(crc_buf + crc_idx) = crc;
 		}
 
-		kunmap_atomic(buff);
+		kunmap_atomic(buf);
 
-		write_sector(crc_buff, crc_sect, bio->bi_disk);
+		write_sector(crc_buf, crc_sect, bio->bi_disk);
 	}
 
-	kfree(crc_buff);
+	kfree(crc_buf);
 }
 
 static bool write_bio_with_crc(struct bio *bio)
@@ -249,23 +249,54 @@ static bool write_bio_with_crc(struct bio *bio)
 
 
 static inline void
-read_sector_both_disks(char *buff_dev0, char *buff_dev1, sector_t sector)
+read_sector_both_disks(char *buf_dev0, char *buf_dev1, sector_t sector)
 {
-	read_sector(buff_dev0, sector, phys_bdev[PHYS_DISK1_IDX]->bd_disk);
-	read_sector(buff_dev1, sector, phys_bdev[PHYS_DISK2_IDX]->bd_disk);
+	read_sector(buf_dev0, sector, phys_bdev[PHYS_DISK1_IDX]->bd_disk);
+	read_sector(buf_dev1, sector, phys_bdev[PHYS_DISK2_IDX]->bd_disk);
 }
 
 static inline void
-write_dirty_crc_sectors(char *crc_buff_dev0, char *crc_buff_dev1,
+write_dirty_crc_sectors(char *crc_buf_dev0, char *crc_buf_dev1,
 		bool dirty_crc_dev0, bool dirty_crc_dev1, sector_t sector)
 {
 	if (dirty_crc_dev0)
-		write_sector(crc_buff_dev0, sector,
+		write_sector(crc_buf_dev0, sector,
 			phys_bdev[PHYS_DISK1_IDX]->bd_disk);
 
 	if (dirty_crc_dev1)
-		write_sector(crc_buff_dev1, sector,
+		write_sector(crc_buf_dev1, sector,
 			phys_bdev[PHYS_DISK2_IDX]->bd_disk);
+}
+
+static bool alloc_buffers(char **buf_dev0, char **buf_dev1,
+		char **crc_buf_dev0, char **crc_buf_dev1)
+{
+	*buf_dev0 = kmalloc(KERNEL_SECTOR_SIZE, GFP_KERNEL);
+	if (!*buf_dev0)
+		return false;
+
+	*buf_dev1 = kmalloc(KERNEL_SECTOR_SIZE, GFP_KERNEL);
+	if (!*buf_dev1)
+		goto err_buf_dev1;
+
+	*crc_buf_dev0 = kmalloc(KERNEL_SECTOR_SIZE, GFP_KERNEL);
+	if (!*crc_buf_dev0)
+		goto err_crc_buf_dev0;
+
+	*crc_buf_dev1 = kmalloc(KERNEL_SECTOR_SIZE, GFP_KERNEL);
+	if (!*crc_buf_dev1)
+		goto err_crc_buf_dev1;
+
+	return true;
+
+err_crc_buf_dev1:
+	kfree(*crc_buf_dev0);
+err_crc_buf_dev0:
+	kfree(*buf_dev1);
+err_buf_dev1:
+	kfree(*buf_dev0);
+
+	return false;
 }
 
 static bool has_valid_crc(struct bio *bio)
@@ -277,77 +308,60 @@ static bool has_valid_crc(struct bio *bio)
 	size_t crc_idx = sizeof(crc_dev0) * sec % KERNEL_SECTOR_SIZE;
 	sector_t crc_sect = LOGICAL_DISK_SECTORS
 		+ sizeof(crc_dev0) * sec / KERNEL_SECTOR_SIZE;
-	char *buff_dev0, *buff_dev1, *crc_buff_dev0, *crc_buff_dev1;
+	char *buf_dev0, *buf_dev1, *crc_buf_dev0, *crc_buf_dev1;
 
-	buff_dev0 = kmalloc(KERNEL_SECTOR_SIZE, GFP_KERNEL);
-	if (!buff_dev0)
+	if (!alloc_buffers(&buf_dev0, &buf_dev1, &crc_buf_dev0, &crc_buf_dev1))
 		return false;
 
-	buff_dev1 = kmalloc(KERNEL_SECTOR_SIZE, GFP_KERNEL);
-	if (!buff_dev1)
-		goto err_buff_dev1;
-
-	crc_buff_dev0 = kmalloc(KERNEL_SECTOR_SIZE, GFP_KERNEL);
-	if (!crc_buff_dev0)
-		goto err_crc_buff_dev0;
-
-	crc_buff_dev1 = kmalloc(KERNEL_SECTOR_SIZE, GFP_KERNEL);
-	if (!crc_buff_dev1)
-		goto err_crc_buff_dev1;
-
 	if (crc_idx)
-		read_sector_both_disks(crc_buff_dev0, crc_buff_dev1,
-			crc_sect++);
+		read_sector_both_disks(crc_buf_dev0, crc_buf_dev1, crc_sect++);
 
 	for (; sec != end_sec; ++sec) {
-		read_sector_both_disks(buff_dev0, buff_dev1, sec);
+		read_sector_both_disks(buf_dev0, buf_dev1, sec);
 		if (!crc_idx) {
-			write_dirty_crc_sectors(crc_buff_dev0, crc_buff_dev1,
+			write_dirty_crc_sectors(crc_buf_dev0, crc_buf_dev1,
 				dirty_crc_dev0, dirty_crc_dev1, crc_sect - 1);
-			read_sector_both_disks(crc_buff_dev0, crc_buff_dev1,
+			read_sector_both_disks(crc_buf_dev0, crc_buf_dev1,
 				crc_sect++);
 
 			dirty_crc_dev0 = false;
 			dirty_crc_dev1 = false;
 		}
 
-		crc_dev0 = crc32(0, buff_dev0, KERNEL_SECTOR_SIZE);
-		crc_dev1 = crc32(0, buff_dev1, KERNEL_SECTOR_SIZE);
+		crc_dev0 = crc32(0, buf_dev0, KERNEL_SECTOR_SIZE);
+		crc_dev1 = crc32(0, buf_dev1, KERNEL_SECTOR_SIZE);
 
-		stored_crc_dev0 = *(u32 *)(crc_buff_dev0 + crc_idx);
-		stored_crc_dev1 = *(u32 *)(crc_buff_dev1 + crc_idx);
+		stored_crc_dev0 = *(u32 *)(crc_buf_dev0 + crc_idx);
+		stored_crc_dev1 = *(u32 *)(crc_buf_dev1 + crc_idx);
 
 		if (crc_dev0 != stored_crc_dev0
 				&& crc_dev1 != stored_crc_dev1) {
 			goto err_crc;
 		} else if (crc_dev0 != stored_crc_dev0) {
 			dirty_crc_dev0 = true;
-			*(u32 *)(crc_buff_dev0 + crc_idx) = stored_crc_dev1;
-			write_sector(buff_dev1, sec,
+			*(u32 *)(crc_buf_dev0 + crc_idx) = stored_crc_dev1;
+			write_sector(buf_dev1, sec,
 				phys_bdev[PHYS_DISK1_IDX]->bd_disk);
 		} else if (crc_dev1 != stored_crc_dev1) {
 			dirty_crc_dev1 = true;
-			*(u32 *)(crc_buff_dev1 + crc_idx) = stored_crc_dev0;
-			write_sector(buff_dev0, sec,
+			*(u32 *)(crc_buf_dev1 + crc_idx) = stored_crc_dev0;
+			write_sector(buf_dev0, sec,
 				phys_bdev[PHYS_DISK2_IDX]->bd_disk);
 		}
 
 		crc_idx = (crc_idx + sizeof(crc_dev0)) % KERNEL_SECTOR_SIZE;
 	}
 
-	write_dirty_crc_sectors(crc_buff_dev0, crc_buff_dev1,
+	write_dirty_crc_sectors(crc_buf_dev0, crc_buf_dev1,
 		dirty_crc_dev0, dirty_crc_dev1, crc_sect - 1);
 
 	ret = true;
 
 err_crc:
-	kfree(crc_buff_dev1);
-err_crc_buff_dev1:
-	kfree(crc_buff_dev0);
-err_crc_buff_dev0:
-	kfree(buff_dev1);
-err_buff_dev1:
-	kfree(buff_dev0);
+	kfree(crc_buf_dev1);
+	kfree(crc_buf_dev0);
+	kfree(buf_dev1);
+	kfree(buf_dev0);
 
 	return ret;
 }
