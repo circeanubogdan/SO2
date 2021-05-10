@@ -139,7 +139,6 @@ static bool copy_sector_data(char *buff, struct page *pg, unsigned int dir)
 	return ret;
 }
 
-// TODO: merge cu functiile de mai sus?
 static void
 handle_sector(char *buff, sector_t sector, struct gendisk *bdev,
 		unsigned int dir)
@@ -190,10 +189,7 @@ static void write_crc(struct bio *bio)
 	if (!crc_buff)
 		return;
 
-	// pr_info("initial: idx = %zu; crc_sect = %lld", crc_idx, crc_sect);
-
 	bio_for_each_segment(bvec, bio, it) {
-		// pr_err("write_crc bl_len %d, bv_off %d\n", bvec.bv_len, bvec.bv_offset);
 		crc_sect = LOGICAL_DISK_SECTORS
 			+ it.bi_sector * sizeof(crc) / KERNEL_SECTOR_SIZE;
 		crc_idx = it.bi_sector * sizeof(crc) % KERNEL_SECTOR_SIZE;
@@ -205,21 +201,14 @@ static void write_crc(struct bio *bio)
 			continue;
 		}
 
-		// pr_info("sector = %lld; len = %u; idx = %zu\n",
-			// it.bi_sector, bvec.bv_len, crc_idx);
-
 		for (i = 0; i != bvec.bv_len; i += KERNEL_SECTOR_SIZE,
 				crc_idx += sizeof(crc)) {
 			crc = crc32(0, buff + i, KERNEL_SECTOR_SIZE);
-			// pr_info("0x%X\n", crc);
 			*(u32 *)(crc_buff + crc_idx) = crc;
 		}
 
 		kunmap_atomic(buff);
 
-		// pr_info("crc citit:\n");
-		// for (i = 0; i != 64; i += 4)
-		// 	pr_info("0x%X\n", *(u32 *)(crc_buff + i));
 		write_sector(crc_buff, crc_sect, bio->bi_disk);
 	}
 
@@ -262,9 +251,20 @@ read_sector_both_disks(char *buff_dev0, char *buff_dev1, sector_t sector)
 	read_sector(buff_dev1, sector, phys_bdev[1]->bd_disk);
 }
 
+static inline void
+write_dirty_crc_sectors(char *crc_buff_dev0, char *crc_buff_dev1,
+		bool dirty_crc_dev0, bool dirty_crc_dev1, sector_t sector)
+{
+	if (dirty_crc_dev0)
+		write_sector(crc_buff_dev0, sector, phys_bdev[0]->bd_disk);
+
+	if (dirty_crc_dev1)
+		write_sector(crc_buff_dev1, sector, phys_bdev[1]->bd_disk);
+}
+
 static bool has_valid_crc(struct bio *bio)
 {
-	bool ret = false;
+	bool ret = false, dirty_crc_dev0 = false, dirty_crc_dev1 = false;
 	u32 crc_dev0, crc_dev1, stored_crc_dev0, stored_crc_dev1;
 	sector_t sec = bio->bi_iter.bi_sector;
 	sector_t end_sec = sec + bio_sectors(bio);
@@ -289,19 +289,20 @@ static bool has_valid_crc(struct bio *bio)
 	if (!crc_buff_dev1)
 		goto err_crc_buff_dev1;
 
-	// pr_info("res = %lld", sizeof(crc_dev0) * sec);
-
 	if (crc_idx)
 		read_sector_both_disks(crc_buff_dev0, crc_buff_dev1, crc_sect++);
 
 	for (; sec != end_sec; ++sec) {
 		read_sector_both_disks(buff_dev0, buff_dev1, sec);
-		if (!crc_idx)
+		if (!crc_idx) {
+			write_dirty_crc_sectors(crc_buff_dev0, crc_buff_dev1,
+				dirty_crc_dev0, dirty_crc_dev1, crc_sect - 1);
 			read_sector_both_disks(crc_buff_dev0, crc_buff_dev1,
 				crc_sect++);
 
-		// pr_info("sec = %lld;; crc_sect = %lld; crc_idx = %zu",
-		// 	sec, crc_sect, crc_idx);
+			dirty_crc_dev0 = false;
+			dirty_crc_dev1 = false;
+		}
 
 		crc_dev0 = crc32(0, buff_dev0, KERNEL_SECTOR_SIZE);
 		crc_dev1 = crc32(0, buff_dev1, KERNEL_SECTOR_SIZE);
@@ -309,25 +310,24 @@ static bool has_valid_crc(struct bio *bio)
 		stored_crc_dev0 = *(u32 *)(crc_buff_dev0 + crc_idx);
 		stored_crc_dev1 = *(u32 *)(crc_buff_dev1 + crc_idx);
 
-		// pr_info("sector %lld; stored0 = 0x%X; crc0 = 0x%X; stored1 = 0x%X; crc1 = 0x%X\n",
-		// 	sec, stored_crc_dev0, crc_dev0, stored_crc_dev1, crc_dev1);
-		// pr_info("dev0: stored = 0x%X; calc = 0x%X\n", stored_crc_dev0, crc_dev0);
-		// pr_info("dev1: stored = 0x%X; calc = 0x%X\n", stored_crc_dev1, crc_dev1);
-
 		if (crc_dev0 != stored_crc_dev0
 				&& crc_dev1 != stored_crc_dev1) {
-			// pr_info("ambele bulite la sectorul %lld\n", sec);
 			goto err_crc;
 		} else if (crc_dev0 != stored_crc_dev0) {
-			// pr_info("dev0 bulit la sectorul %lld\n", sec);
-			// TODO: corecteaza dev 0
+			dirty_crc_dev0 = true;
+			*(u32 *)(crc_buff_dev0 + crc_idx) = stored_crc_dev1;
+			write_sector(buff_dev1, sec, phys_bdev[0]->bd_disk);
 		} else if (crc_dev1 != stored_crc_dev1) {
-			// TODO: corecteaza dev 1
-			// pr_info("dev1 bulit la sectorul %lld\n", sec);
+			dirty_crc_dev1 = true;
+			*(u32 *)(crc_buff_dev1 + crc_idx) = stored_crc_dev0;
+			write_sector(buff_dev0, sec, phys_bdev[1]->bd_disk);
 		}
 
 		crc_idx = (crc_idx + sizeof(crc_dev0)) % KERNEL_SECTOR_SIZE;
 	}
+
+	write_dirty_crc_sectors(crc_buff_dev0, crc_buff_dev1,
+		dirty_crc_dev0, dirty_crc_dev1, crc_sect - 1);
 
 	ret = true;
 
@@ -352,6 +352,9 @@ static bool read_bio(struct bio *bio)
 
 	// TODO: incearca direct cu bio
 	bio_copy = duplicate_bio(bio, 0);
+	if (!bio_copy)
+		return false;
+
 	submit_bio_wait(bio_copy);
 	bio_put(bio_copy);
 
