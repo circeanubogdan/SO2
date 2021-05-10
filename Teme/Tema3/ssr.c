@@ -32,13 +32,12 @@
 
 
 struct work_info {
-	int devno;  // TODO: de scos
 	struct bio *bio;
 	struct work_struct work;
 };
 
 static struct block_device *phys_bdev[NUM_PHYS_DEV];
-static char* phys_disk_names[] = {PHYSICAL_DISK1_NAME, PHYSICAL_DISK2_NAME};
+static char *phys_disk_names[] = {PHYSICAL_DISK1_NAME, PHYSICAL_DISK2_NAME};
 
 static DEFINE_MUTEX(lock_dev0);
 static DEFINE_MUTEX(lock_dev1);
@@ -68,7 +67,6 @@ static struct bio *duplicate_bio(struct bio *bio, unsigned int devno)
 	new_bio->bi_opf = bio->bi_opf;
 	new_bio->bi_iter.bi_sector = bio->bi_iter.bi_sector;
 
-	// TODO: la nevoie, fa cate un bio cu cate o pagina
 	bio_for_each_segment(bvec, bio, i)
 		if (!bio_add_page(new_bio, bvec.bv_page, bvec.bv_len,
 				bvec.bv_offset)) {
@@ -97,7 +95,7 @@ create_one_sector_bio(struct gendisk *bdev, sector_t sector, unsigned int dir)
 		goto err_alloc_page;
 	}
 
-	if (!bio_add_page(bio, pg, PAGE_SIZE, 0)) {
+	if (!bio_add_page(bio, pg, KERNEL_SECTOR_SIZE, 0)) {
 		pr_err("bio_add_page failed\n");
 		goto err_bio_add_page;
 	}
@@ -128,9 +126,9 @@ static bool copy_sector_data(char *buff, struct page *pg, unsigned int dir)
 	}
 
 	if (dir == WRITE)
-		memcpy(pg_buff, buff, PAGE_SIZE);
+		memcpy(pg_buff, buff, KERNEL_SECTOR_SIZE);
 	else if (dir == READ)
-		memcpy(buff, pg_buff, PAGE_SIZE);
+		memcpy(buff, pg_buff, KERNEL_SECTOR_SIZE);
 	else {
 		pr_err("unknown data direction 0x%X\n", dir);
 		ret = false;
@@ -153,43 +151,44 @@ handle_sector(char *buff, sector_t sector, struct gendisk *bdev,
 		return;
 	}
 
+	if (dir == READ)
+		submit_bio_wait(bio);
+
 	if (!copy_sector_data(buff, bio->bi_io_vec->bv_page, dir)) {
 		pr_err("failed to copy data to buffer\n");
 		goto err_copy_sector_data;
 	}
 
-	submit_bio_wait(bio);
+	if (dir == WRITE)
+		submit_bio_wait(bio);
 
 err_copy_sector_data:
 	__free_page(bio->bi_io_vec->bv_page);
 	bio_put(bio);
 }
 
-static inline void read_sector(char *buff, sector_t sector, struct gendisk *bdev)
+static inline void read_sector(char *buff, sector_t sect, struct gendisk *bdev)
 {
-	handle_sector(buff, sector, bdev, READ);
+	handle_sector(buff, sect, bdev, READ);
 }
 
-static inline void write_sector(char *buff, sector_t sector, struct gendisk *bdev)
+static inline void write_sector(char *buff, sector_t sect, struct gendisk *bdev)
 {
-	handle_sector(buff, sector, bdev, WRITE);
+	handle_sector(buff, sect, bdev, WRITE);
 }
 
 static void write_crc(struct bio *bio)
 {
 	u32 crc, i;
-
 	size_t crc_idx;
 	sector_t crc_sect;
 	struct bio_vec bvec;
 	struct bvec_iter it;
 	char *buff;
-	char *crc_buff = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	char *crc_buff = kmalloc(KERNEL_SECTOR_SIZE, GFP_KERNEL);
 
-	if (!crc_buff) {
-		pr_err("kmalloc crc_buff failed\n");
+	if (!crc_buff)
 		return;
-	}
 
 	// pr_info("initial: idx = %zu; crc_sect = %lld", crc_idx, crc_sect);
 
@@ -223,36 +222,41 @@ static void write_crc(struct bio *bio)
 		// 	pr_info("0x%X\n", *(u32 *)(crc_buff + i));
 		write_sector(crc_buff, crc_sect, bio->bi_disk);
 	}
-		
 
-err_prev_crc_buff:
 	kfree(crc_buff);
 }
 
-static void write_bio_with_crc(struct bio *bio)
+static bool write_bio_with_crc(struct bio *bio)
 {
-	struct bio *bio_dev0 = duplicate_bio(bio, 0);
-	// struct bio *bio_dev01 = duplicate_bio(bio, 0);
-	struct bio *bio_dev1 = duplicate_bio(bio, 1);
-	// struct bio *bio_dev11 = duplicate_bio(bio, 1);
+	struct bio *bio_dev0, *bio_dev1;
+
+	bio_dev0 = duplicate_bio(bio, 0);
+	if (!bio_dev0)
+		return false;
+
+	bio_dev1 = duplicate_bio(bio, 1);
+	if (!bio_dev1) {
+		bio_put(bio_dev0);
+		return false;
+	}
 
 	mutex_lock(&lock_dev0);
 	write_crc(bio_dev0);
 	mutex_unlock(&lock_dev0);
-	// bio_put(bio_dev01);
 	submit_bio_wait(bio_dev0);
 	bio_put(bio_dev0);
 
 	mutex_lock(&lock_dev1);
 	write_crc(bio_dev1);
 	mutex_unlock(&lock_dev1);
-	// bio_put(bio_dev11);
 	submit_bio_wait(bio_dev1);
 	bio_put(bio_dev1);
+
+	return true;
 }
 
 static inline void
-read_page_both_disks(char *buff_dev0, char *buff_dev1, sector_t sector)
+read_sector_both_disks(char *buff_dev0, char *buff_dev1, sector_t sector)
 {
 	read_sector(buff_dev0, sector, phys_bdev[0]->bd_disk);
 	read_sector(buff_dev1, sector, phys_bdev[1]->bd_disk);
@@ -260,61 +264,40 @@ read_page_both_disks(char *buff_dev0, char *buff_dev1, sector_t sector)
 
 static bool has_valid_crc(struct bio *bio)
 {
-	bool ret = true;
+	bool ret = false;
 	u32 crc_dev0, crc_dev1, stored_crc_dev0, stored_crc_dev1;
-	sector_t sec = bio->bi_iter.bi_sector, end_sec = bio_end_sector(bio);
-	// size_t num_crc_sect = KERNEL_SECTOR_SIZE / sizeof(crc_dev0);
-	size_t crc_per_sect = KERNEL_SECTOR_SIZE / sizeof(crc_dev0);
-	// sector_t crc_sect = sec / num_crc_sect + LOGICAL_DISK_SECTORS; // sectorul la care incepe pagina cu crc-uri
-	// size_t crc_idx = (sec % num_crc_sect) * sizeof(crc_dev0);  // index in crc_buff (pagina)
+	sector_t sec = bio->bi_iter.bi_sector;
+	sector_t end_sec = sec + bio_sectors(bio);
 	size_t crc_idx = sizeof(crc_dev0) * sec % KERNEL_SECTOR_SIZE;
-
-	/*
-	sec = 32
-	offset = 4 * 32 octeti
-	[ | | | ][ | | | ][ | | | ][ | | | ][ | | | ][ | | | ][ | | | ]
-	*/
-
-	sector_t crc_sect = LOGICAL_DISK_SECTORS + sizeof(crc_dev0) * sec / KERNEL_SECTOR_SIZE;
+	sector_t crc_sect = LOGICAL_DISK_SECTORS
+		+ sizeof(crc_dev0) * sec / KERNEL_SECTOR_SIZE;
 	char *buff_dev0, *buff_dev1, *crc_buff_dev0, *crc_buff_dev1;
 
-	buff_dev0 = kmalloc(PAGE_SIZE, GFP_KERNEL);
-	if (!buff_dev0) {
-		pr_err("kmalloc buffer dev0 failed\n");
+	buff_dev0 = kmalloc(KERNEL_SECTOR_SIZE, GFP_KERNEL);
+	if (!buff_dev0)
 		return false;
-	}
 
-	buff_dev1 = kmalloc(PAGE_SIZE, GFP_KERNEL);
-	if (!buff_dev1) {
-		pr_err("kmalloc buffer dev1 failed\n");
-		ret = false;
+	buff_dev1 = kmalloc(KERNEL_SECTOR_SIZE, GFP_KERNEL);
+	if (!buff_dev1)
 		goto err_buff_dev1;
-	}
 
-	crc_buff_dev0 = kmalloc(PAGE_SIZE, GFP_KERNEL);
-	if (!crc_buff_dev0) {
-		pr_err("kmalloc crc buffer dev0 failed\n");
-		ret = false;
+	crc_buff_dev0 = kmalloc(KERNEL_SECTOR_SIZE, GFP_KERNEL);
+	if (!crc_buff_dev0)
 		goto err_crc_buff_dev0;
-	}
 
-	crc_buff_dev1 = kmalloc(PAGE_SIZE, GFP_KERNEL);
-	if (!crc_buff_dev1) {
-		pr_err("kmalloc crc buffer dev1 failed\n");
-		ret = false;
+	crc_buff_dev1 = kmalloc(KERNEL_SECTOR_SIZE, GFP_KERNEL);
+	if (!crc_buff_dev1)
 		goto err_crc_buff_dev1;
-	}
 
 	// pr_info("res = %lld", sizeof(crc_dev0) * sec);
 
 	if (crc_idx)
-		read_page_both_disks(crc_buff_dev0, crc_buff_dev1, crc_sect++);
+		read_sector_both_disks(crc_buff_dev0, crc_buff_dev1, crc_sect++);
 
-	// TODO: cam urat
 	for (; sec != end_sec; ++sec) {
-		read_page_both_disks(buff_dev0, buff_dev1, sec);
+		read_sector_both_disks(buff_dev0, buff_dev1, sec);
 		if (!crc_idx)
-			read_page_both_disks(crc_buff_dev0, crc_buff_dev1,
+			read_sector_both_disks(crc_buff_dev0, crc_buff_dev1,
 				crc_sect++);
 
 		// pr_info("sec = %lld;; crc_sect = %lld; crc_idx = %zu",
@@ -326,27 +309,30 @@ static bool has_valid_crc(struct bio *bio)
 		stored_crc_dev0 = *(u32 *)(crc_buff_dev0 + crc_idx);
 		stored_crc_dev1 = *(u32 *)(crc_buff_dev1 + crc_idx);
 
+		// pr_info("sector %lld; stored0 = 0x%X; crc0 = 0x%X; stored1 = 0x%X; crc1 = 0x%X\n",
+		// 	sec, stored_crc_dev0, crc_dev0, stored_crc_dev1, crc_dev1);
 		// pr_info("dev0: stored = 0x%X; calc = 0x%X\n", stored_crc_dev0, crc_dev0);
 		// pr_info("dev1: stored = 0x%X; calc = 0x%X\n", stored_crc_dev1, crc_dev1);
 
 		if (crc_dev0 != stored_crc_dev0
 				&& crc_dev1 != stored_crc_dev1) {
-			ret = false;
-			// pr_info("ambele bulite la sector %lld\n", sec);
-			// break;
+			// pr_info("ambele bulite la sectorul %lld\n", sec);
+			goto err_crc;
 		} else if (crc_dev0 != stored_crc_dev0) {
-			// pr_info("dev0 bulit la sector %lld\n", sec);
+			// pr_info("dev0 bulit la sectorul %lld\n", sec);
 			// TODO: corecteaza dev 0
 		} else if (crc_dev1 != stored_crc_dev1) {
 			// TODO: corecteaza dev 1
-			// pr_info("dev1 bulit la sector %lld\n", sec);
+			// pr_info("dev1 bulit la sectorul %lld\n", sec);
 		}
 
 		crc_idx = (crc_idx + sizeof(crc_dev0)) % KERNEL_SECTOR_SIZE;
 	}
 
-	kfree(crc_buff_dev1);
+	ret = true;
 
+err_crc:
+	kfree(crc_buff_dev1);
 err_crc_buff_dev1:
 	kfree(crc_buff_dev0);
 err_crc_buff_dev0:
@@ -357,42 +343,45 @@ err_buff_dev1:
 	return ret;
 }
 
-static void read_bio(struct bio *bio)
+static bool read_bio(struct bio *bio)
 {
 	struct bio *bio_copy;
 
-	// if (!has_valid_crc(bio)) {
-	// 	// bio_io_error(bio);
-	// 	// return;
-	// 	// pr_info("nu e bune\n");
-	// }
+	if (!has_valid_crc(bio))
+		return false;
 
 	// TODO: incearca direct cu bio
 	bio_copy = duplicate_bio(bio, 0);
 	submit_bio_wait(bio_copy);
 	bio_put(bio_copy);
+
+	return true;
 }
 
 static void ssr_work_handler(struct work_struct *work)
 {
 	struct work_info *wi = container_of(work, struct work_info, work);
 	struct bio *bio = wi->bio;
+	bool ret;
 
-	switch (bio_data_dir(bio))
-	{
+	switch (bio_data_dir(bio)) {
 	case WRITE:
-		write_bio_with_crc(bio);
+		ret = write_bio_with_crc(bio);
 		break;
 	case READ:
-		read_bio(bio);
+		ret = read_bio(bio);
 		break;
 	default:
 		pr_err("unkown data directection\n");
+		ret = false;
 		break;
 	}
 
-	// TODO: crapa daca dau bio_io_error()?
-	bio_endio(bio);
+	if (ret)
+		bio_endio(bio);
+	else
+		bio_io_error(bio);
+
 	kfree(wi);
 }
 
@@ -406,42 +395,22 @@ static void ssr_release(struct gendisk *gd, fmode_t mode)
 {
 }
 
-// TODO: de redenumit in create_work_info
-static struct work_info *create_work_info_same_bio(struct bio *bio)
+static struct work_info *create_work_info(struct bio *bio)
 {
 	struct work_info *info = kmalloc(sizeof(*info), GFP_KERNEL);
-	if (!info) {
-		pr_err("Cannot allocate work_info\n");
+
+	if (!info)
 		return NULL;
-	}
 
 	INIT_WORK(&info->work, ssr_work_handler);
-	info->devno = NUM_PHYS_DEV;
 	info->bio = bio;
-
-	return info;
-}
-
-// TODO: de sters
-static struct work_info *create_work_info(int devno, struct bio *bio)
-{
-	struct work_info *info = create_work_info_same_bio(bio);
-
-	info->bio = duplicate_bio(bio, devno);
-	if (!info->bio) {
-		pr_err("duplicate_bio failed\n");
-		kfree(info);
-		return NULL;
-	}
-
-	info->devno = devno;
 
 	return info;
 }
 
 static blk_qc_t ssr_submit_bio(struct bio *bio)
 {
-	if(!schedule_work(&create_work_info_same_bio(bio)->work))
+	if (!schedule_work(&create_work_info(bio)->work))
 		pr_err("schedule_work failed\n");
 
 	return BLK_QC_T_NONE;
