@@ -53,7 +53,6 @@ static struct ssr_dev {
 
 static struct bio *duplicate_bio(struct bio *bio, unsigned int devno)
 {
-	// TODO: dar bio_clone?
 	struct bio_vec bvec;
 	struct bvec_iter i;
 	struct bio *new_bio = bio_alloc(GFP_NOIO, bio->bi_vcnt);
@@ -176,6 +175,7 @@ static inline void write_sector(char *buff, sector_t sect, struct gendisk *bdev)
 	handle_sector(buff, sect, bdev, WRITE);
 }
 
+
 static void write_crc(struct bio *bio)
 {
 	u32 crc, i;
@@ -243,6 +243,7 @@ static bool write_bio_with_crc(struct bio *bio)
 
 	return true;
 }
+
 
 static inline void
 read_sector_both_disks(char *buff_dev0, char *buff_dev1, sector_t sector)
@@ -350,7 +351,6 @@ static bool read_bio(struct bio *bio)
 	if (!has_valid_crc(bio))
 		return false;
 
-	// TODO: incearca direct cu bio
 	bio_copy = duplicate_bio(bio, 0);
 	if (!bio_copy)
 		return false;
@@ -360,6 +360,7 @@ static bool read_bio(struct bio *bio)
 
 	return true;
 }
+
 
 static void ssr_work_handler(struct work_struct *work)
 {
@@ -398,6 +399,7 @@ static void ssr_release(struct gendisk *gd, fmode_t mode)
 {
 }
 
+
 static struct work_info *create_work_info(struct bio *bio)
 {
 	struct work_info *info = kmalloc(sizeof(*info), GFP_KERNEL);
@@ -429,7 +431,6 @@ static const struct block_device_operations ssr_block_ops = {
 static blk_status_t
 ssr_request(struct blk_mq_hw_ctx *hctx, const struct blk_mq_queue_data *bd)
 {
-	// TODO: alt return?
 	return BLK_STS_OK;
 }
 
@@ -449,7 +450,7 @@ static int create_block_device(struct ssr_dev *dev)
 		goto out_vmalloc;
 	}
 
-	/* Initialize tag set. */
+	/* Initialise the tag set. */
 	dev->tag_set.ops = &ssr_queue_ops;
 	dev->tag_set.nr_hw_queues = NR_HW_QUEUES;
 	dev->tag_set.queue_depth = QUEUE_DEPTH;
@@ -472,7 +473,7 @@ static int create_block_device(struct ssr_dev *dev)
 	blk_queue_logical_block_size(dev->queue, KERNEL_SECTOR_SIZE);
 	dev->queue->queuedata = dev;
 
-	/* Initialize the gendisk structure. */
+	/* Initialise the gendisk structure. */
 	dev->gd = alloc_disk(SSR_NUM_MINORS);
 	if (!dev->gd) {
 		pr_err("alloc_disk: failure\n");
