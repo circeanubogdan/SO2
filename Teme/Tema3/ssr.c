@@ -607,7 +607,7 @@ static int __init ssr_init(void)
 		goto out_create_device;
 	}
 
-	workqueue = create_workqueue(WORKQUEUE_NAME);
+	workqueue = create_singlethread_workqueue(WORKQUEUE_NAME);
 	if (!workqueue) {
 		pr_err("Unable to create workqueue\n");
 		goto out;
