@@ -26,6 +26,8 @@
 #define LOGICAL_DISK_BASE_NAME	"ssr"
 #define NUM_PHYS_DEV		2
 
+#define WORKQUEUE_NAME		"ssr_workqueue"
+
 #define NR_HW_QUEUES		1
 #define QUEUE_DEPTH		128
 #define CMD_SIZE		0
@@ -39,11 +41,10 @@ struct work_info {
 	struct work_struct work;
 };
 
+static struct workqueue_struct *workqueue;
+
 static struct block_device *phys_bdev[NUM_PHYS_DEV];
 static char *phys_disk_names[] = {PHYSICAL_DISK1_NAME, PHYSICAL_DISK2_NAME};
-
-static DEFINE_MUTEX(lock_dev0);
-static DEFINE_MUTEX(lock_dev1);
 
 static struct ssr_dev {
 	size_t size;
@@ -232,15 +233,11 @@ static bool write_bio_with_crc(struct bio *bio)
 		return false;
 	}
 
-	mutex_lock(&lock_dev0);
 	write_crc(bio_dev0);
-	mutex_unlock(&lock_dev0);
 	submit_bio_wait(bio_dev0);
 	bio_put(bio_dev0);
 
-	mutex_lock(&lock_dev1);
 	write_crc(bio_dev1);
-	mutex_unlock(&lock_dev1);
 	submit_bio_wait(bio_dev1);
 	bio_put(bio_dev1);
 
@@ -437,8 +434,8 @@ static struct work_info *create_work_info(struct bio *bio)
 
 static blk_qc_t ssr_submit_bio(struct bio *bio)
 {
-	if (!schedule_work(&create_work_info(bio)->work))
-		pr_err("schedule_work failed\n");
+	if (!queue_work(workqueue, &create_work_info(bio)->work))
+		pr_err("queue_work failed\n");
 
 	return BLK_QC_T_NONE;
 }
@@ -607,12 +604,20 @@ static int __init ssr_init(void)
 	err = create_block_device(&g_dev);
 	if (err) {
 		pr_err("Unable to create block device\n");
+		goto out_create_device;
+	}
+
+	workqueue = create_workqueue(WORKQUEUE_NAME);
+	if (!workqueue) {
+		pr_err("Unable to create workqueue\n");
 		goto out;
 	}
 
 	return 0;
 
 out:
+	delete_block_device(&g_dev);
+out_create_device:
 	unregister_blkdev(SSR_MAJOR, LOGICAL_DISK_NAME);
 out_close_disks:
 	close_disks();
@@ -622,6 +627,8 @@ out_close_disks:
 
 static void __exit ssr_exit(void)
 {
+	flush_workqueue(workqueue);
+	destroy_workqueue(workqueue);
 	delete_block_device(&g_dev);
 	unregister_blkdev(SSR_MAJOR, LOGICAL_DISK_NAME);
 	close_disks();
