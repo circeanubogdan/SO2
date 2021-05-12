@@ -63,6 +63,12 @@ operatiile necesare pentru `mount` si `umount`, iar in labul 9 se implementeaza
 operatiile pentru crearea fisierelor si directoarelor.
 
 
+### Lab 10 - Networking
+Un subsistem misto si un lab la misto. Cumva similar cu tema 1, se intercepteaza
+trafic TCP si UDP (folosind `netfilter`).
+
+
+
 ## Teme
 ### Tema 0 - API-ul de liste din Kernel
 Se implementeaza un modul de kernel care prin scrieri catre
