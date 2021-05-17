@@ -27,6 +27,12 @@
 #define POW2(bits)			(1 << (bits))
 
 
+struct pitix_inode_info {
+	struct pitix_inode *pi;
+	struct inode ino;
+};
+
+
 static int pitix_readdir(struct file *filp, struct dir_context *ctx)
 {
 	return 0;
@@ -80,19 +86,144 @@ pitix_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags)
 	return NULL;
 }
 
+struct inode *pitix_new_inode(struct super_block *sb)
+{
+	struct pitix_super_block *psb = pitix_sb(sb);
+	struct inode *inode = NULL;
+	ulong idx;
+
+	psb->imap_bh = sb_bread(sb, psb->imap_block);
+	if (!psb->imap_bh) {
+		pr_err("failed to read IMAP block\n");
+		return NULL;
+	}
+	psb->imap = psb->imap_bh->b_data;
+	
+	idx = find_first_zero_bit((ulong *)psb->imap, sb->s_blocksize);
+	if (idx == sb->s_blocksize) {
+		pr_err("IMAP full\n");
+		goto out_brelse;
+	}
+
+	__test_and_set_bit(idx, (ulong *)psb->imap);
+	mark_buffer_dirty(psb->imap_bh);
+
+	inode = new_inode(sb);
+	inode->i_uid = current_fsuid();
+	inode->i_gid = current_fsgid();
+	inode->i_ino = idx;
+	inode->i_mtime = inode->i_atime = inode->i_ctime = current_time(inode);
+	inode->i_blocks = 0;
+
+	insert_inode_hash(inode);
+
+out_brelse:
+	brelse(psb->imap_bh);
+	return NULL;
+}
+
+static int pitix_add_link(struct dentry *dentry, struct inode *inode)
+{
+	struct buffer_head *dir_bh;
+	struct inode *dir = dentry->d_parent->d_inode;
+	struct super_block *sb = dir->i_sb;
+	struct pitix_inode_info *pii
+		= container_of(dir, struct pitix_inode_info, ino);
+	struct pitix_dir_entry *pde = NULL;
+	int i, ret = 0, max_entries = dir_entries_per_block(sb);
+
+
+	if (!(dir_bh = sb_bread(sb, pii->pi->direct_data_blocks[0]))) {
+		pr_err("failed to read directoty block\n");
+		return -ENOMEM;
+	}
+
+	for (i = 0; i != max_entries; ++i) {
+		pde = (struct pitix_dir_entry *)dir_bh->b_data + i;
+		if (!pde->ino)
+			break;
+	}
+
+	if (!pde) {
+		ret = -ENOSPC;
+		pr_err("directory full\n");
+		goto out_brelse;
+	}
+
+	pde->ino = inode->i_ino;
+	memcpy(pde->name, dentry->d_name.name, PITIX_NAME_LEN);
+	dir->i_mtime = dir->i_ctime = current_time(inode);
+
+	mark_buffer_dirty(dir_bh);
+
+out_brelse:
+	brelse(dir_bh);
+	return ret;
+}
+
 static int
 pitix_create(struct inode *dir, struct dentry *dentry, umode_t mode, bool excl)
 {
+	struct inode *inode = pitix_new_inode(dir->i_sb);
+	struct pitix_inode_info *pii;
+	int ret;
+
+	if(!inode) {
+		pr_err("error allocationg new inode\n");
+		return -ENOMEM;
+	}
+
+	inode->i_mode = mode;
+	inode->i_op = &pitix_file_inode_operations;
+	inode->i_fop = &pitix_file_operations;
+
+	pii = container_of(inode, struct pitix_inode_info, ino);
+
+	ret = pitix_add_link(dentry, inode);
+	if (ret) {
+		pr_err("failed to add inode %lu to dentry %s",
+			inode->i_ino, dentry->d_name.name);
+		goto err_pitix_add_link;
+	}
+
+	d_instantiate(dentry, inode);
+	mark_inode_dirty(inode);
+
 	return 0;
+
+err_pitix_add_link:
+	iput(inode);
+	return ret;
 }
 
 int pitix_get_block(struct inode *inode, sector_t block,
 		struct buffer_head *bh_result, int create)
 {
-	// pr_info("ino = %ld; bl = %lld; bh_size = %d; create = %d",
-	// 	inode->i_ino, block, bh_result->b_size, create);
-	
-	map_bh(bh_result, inode->i_sb, block);
+	struct pitix_inode_info *pii
+		= container_of(inode, struct pitix_inode_info, ino);
+	struct pitix_inode *pi = pii->pi;
+	struct super_block *sb = inode->i_sb;
+	struct buffer_head *indir_bh;
+
+	pr_info("ino = %ld; bl = %lld; bh_size = %d; create = %d",
+		inode->i_ino, block, bh_result->b_size, create);
+
+	if (block >= get_blocks(sb))
+		return -EINVAL;
+
+	if (block < INODE_DIRECT_DATA_BLOCKS)
+		block = pi->direct_data_blocks[block];
+	else {
+		if (!(indir_bh = sb_bread(sb, pi->indirect_data_block)))
+			return -ENOMEM;
+
+		block -= INODE_DIRECT_DATA_BLOCKS;
+		block = *((__u16 *)indir_bh->b_data + block);
+
+		brelse(indir_bh);
+	}
+
+	map_bh(bh_result, inode->i_sb, pitix_sb(sb)->dzone_block + block);
 	
 	return 0;
 }
@@ -167,11 +298,28 @@ static void pitix_put_super(struct super_block *sb)
 	brelse(psb->imap_bh);
 }
 
+static struct inode *pitix_allocate_inode(struct super_block *s)
+{
+	struct pitix_inode_info *pii = kzalloc(sizeof(*pii), GFP_KERNEL);
+
+	if (!pii)
+		return NULL;
+
+	inode_init_once(&pii->ino);
+
+	return &pii->ino;
+}
+
+static void pitix_destroy_inode(struct inode *inode)
+{
+	kfree(container_of(inode, struct pitix_inode_info, ino));
+}
+
 static const struct super_operations pitix_ops = {
 	.statfs = simple_statfs,
 	.put_super = pitix_put_super,
-	// .alloc_inode	= minfs_alloc_inode,
-	// .destroy_inode = minfs_destroy_inode,
+	.alloc_inode = pitix_allocate_inode,
+	.destroy_inode = pitix_destroy_inode
 	// .write_inode	= minfs_write_inode,
 };
 
@@ -193,6 +341,7 @@ read_inode_from_disk(struct super_block *s, ino_t ino, struct buffer_head **bhp)
 struct inode *pitix_iget(struct super_block *s, ino_t ino)
 {
 	struct pitix_inode *pi;
+	struct pitix_inode_info *pii;
 	struct buffer_head *bh;
 	struct inode *inode;
 
@@ -201,6 +350,7 @@ struct inode *pitix_iget(struct super_block *s, ino_t ino)
 		pr_err("iget_locked failed\n");
 		return ERR_PTR(-ENOMEM);
 	}
+	pii = container_of(inode, struct pitix_inode_info, ino);
 
 	if (!(inode->i_state & I_NEW))
 		return inode;
@@ -209,6 +359,7 @@ struct inode *pitix_iget(struct super_block *s, ino_t ino)
 		iget_failed(inode);
 		return ERR_PTR(-EIO);
 	}
+	pii->pi = pi;
 
 	inode->i_sb = s;
 	inode->i_mode = pi->mode;
