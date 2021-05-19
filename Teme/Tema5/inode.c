@@ -48,12 +48,31 @@ static struct inode *pitix_allocate_inode(struct super_block *s)
 static void pitix_destroy_inode(struct inode *inode)
 {
 	// TODO: repara iput + kfree(pi)
+	// TODO: elibereaza din imap
 	kfree(inode);
 }
 
 int pitix_write_inode(struct inode *inode, struct writeback_control *wbc)
 {
-	// TODO
+	struct pitix_inode *pi, *orig_pi = pitix_i(inode);
+	struct pitix_super_block *psb = pitix_sb(inode->i_sb);
+	long inodes_per_block = pitix_inodes_per_block(inode->i_sb);
+	ulong block = inode->i_ino / inodes_per_block + psb->izone_block;
+	struct buffer_head *bh = sb_bread(inode->i_sb, block);
+
+	if (!bh)
+		return -ENOMEM;
+
+	pi = (struct pitix_inode *)bh->b_data + inode->i_ino % inodes_per_block;
+
+	init_pitix_info(pi, inode);
+	pi->indirect_data_block = orig_pi->indirect_data_block;
+	memcpy(pi->direct_data_blocks, orig_pi->direct_data_blocks,
+		sizeof(pi->direct_data_blocks));
+
+	mark_buffer_dirty(bh);
+	brelse(bh);
+
 	return 0;
 }
 
@@ -66,6 +85,8 @@ static int pitix_statfs(struct dentry *dentry, struct kstatfs *statfs)
 
 	statfs->f_bfree = psb->bfree;
 	statfs->f_ffree = psb->ffree;
+	statfs->f_blocks = get_blocks(sb);
+	statfs->f_files = get_inodes(sb);
 
 	return 0;
 }

@@ -25,8 +25,8 @@
 static inline void init_pitix_info(struct pitix_inode *pi, struct inode *inode)
 {
 	pi->mode = inode->i_mode;
-	pi->uid = inode->i_uid.val;
-	pi->gid = inode->i_gid.val;
+	pi->uid = i_uid_read(inode);
+	pi->gid = i_gid_read(inode);
 	pi->size = inode->i_size;
 	pi->time = inode->i_mtime.tv_sec;
 }

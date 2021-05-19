@@ -139,9 +139,9 @@ out_brelse:
 static int
 pitix_create(struct inode *dir, struct dentry *dentry, umode_t mode, bool excl)
 {
-	// struct super_block *sb = dir->i_sb;
-	// struct pitix_super_block *psb = pitix_sb(sb);
-	// struct pitix_inode *pi_dir = pitix_i(dir);
+	struct super_block *sb = dir->i_sb;
+	struct pitix_super_block *psb = pitix_sb(sb);
+	struct pitix_inode *pi_dir = pitix_i(dir);
 	struct inode *inode;
 	struct pitix_inode *pi;
 	// int max_dentries = dir_entries_per_block(sb);
@@ -150,7 +150,7 @@ pitix_create(struct inode *dir, struct dentry *dentry, umode_t mode, bool excl)
 	// if (pi_dir->size >= max_dentries)
 	// 	return -ENOSPC;
 
-	if (!(inode = pitix_new_inode(dir->i_sb))) {
+	if (!(inode = pitix_new_inode(sb))) {
 		pr_err("error allocationg new inode\n");
 		return -ENOMEM;
 	}
@@ -164,6 +164,7 @@ pitix_create(struct inode *dir, struct dentry *dentry, umode_t mode, bool excl)
 	} else if (S_ISDIR(mode)) {
 		inode->i_op = &pitix_dir_inode_operations;
 		inode->i_fop = &pitix_dir_operations;
+		inode->i_size = sb->s_blocksize;
 	}
 	inode->i_mapping->a_ops = &pitix_aops;
 
@@ -181,7 +182,7 @@ pitix_create(struct inode *dir, struct dentry *dentry, umode_t mode, bool excl)
 	d_instantiate(dentry, inode);
 	mark_inode_dirty(inode);
 
-	// --psb->bfree;
+	--psb->bfree;
 
 	return 0;
 
