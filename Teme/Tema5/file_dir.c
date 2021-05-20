@@ -193,10 +193,16 @@ static int pitix_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
 
 static int pitix_unlink(struct inode *dir, struct dentry *dentry)
 {
-	struct pitix_super_block *psb = pitix_sb(d_inode(dentry)->i_sb);
+	struct inode *inode = d_inode(dentry);
+	struct super_block *sb = inode->i_sb;
+	struct pitix_super_block *psb = pitix_sb(sb);
+	ulong used_blocks = inode->i_size >> psb->block_size_bits;
+
+	if (!(used_blocks % sb->s_blocksize))
+		++used_blocks;
+	psb->bfree += used_blocks;
 
 	++psb->ffree;
-	++psb->bfree;
 
 	return 0;
 }
@@ -205,8 +211,8 @@ static int pitix_rmdir(struct inode *dir, struct dentry *dentry)
 {
 	struct pitix_super_block *psb = pitix_sb(d_inode(dentry)->i_sb);
 
-	++psb->ffree;
 	++psb->bfree;
+	++psb->ffree;
 
 	return 0;
 }
