@@ -30,7 +30,7 @@ static struct file_system_type pitix_fs_type = {
 	.owner = THIS_MODULE,
 	.name = PITIX_NAME,
 	.mount = pitix_mount,
-	.kill_sb = kill_block_super,  // TODO: trebuie schimbat?
+	.kill_sb = kill_block_super,
 	.fs_flags = FS_REQUIRES_DEV
 };
 

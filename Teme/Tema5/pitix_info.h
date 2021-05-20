@@ -29,8 +29,6 @@ static inline void init_pitix_info(struct pitix_inode *pi, struct inode *inode)
 	pi->gid = i_gid_read(inode);
 	pi->size = inode->i_size;
 	pi->time = inode->i_mtime.tv_sec;
-	pi->indirect_data_block = U16_MAX;
-	memset(pi->direct_data_blocks, U8_MAX, sizeof(pi->direct_data_blocks));
 }
 
 #endif  /* _PITIX_INFO_H_ */

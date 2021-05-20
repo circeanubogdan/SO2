@@ -20,22 +20,6 @@
 #include "pitix_info.h"
 
 
-static sector_t
-check_unallocated_block(__u16 *initial_blp, struct super_block *sb, bool create)
-{
-	__u16 block = *initial_blp;
-
-	if (block != U16_MAX)
-		return block;
-
-	if (!create)
-		return -EIO;
-
-	block = pitix_alloc_block(sb);
-	*initial_blp = block;
-	return block;
-}
-
 int pitix_get_block(struct inode *inode, sector_t block,
 		struct buffer_head *bh_result, int create)
 {
@@ -43,48 +27,29 @@ int pitix_get_block(struct inode *inode, sector_t block,
 	struct super_block *sb = inode->i_sb;
 	struct pitix_super_block *psb = pitix_sb(sb);
 	__u8 dzone_block = psb->dzone_block;
-	__u16 *indirect_block;
 	struct buffer_head *indir_bh;
-	int idx;
-	bool new_indir = false;
-
-	// pr_info("[pitix_get_block]: ino = %lu; bl = %llu; create = %d\n",
-	// 	inode->i_ino, block, create);
 
 	if (block >= get_blocks(sb))
 		return -EINVAL;
 
-	if (block < INODE_DIRECT_DATA_BLOCKS)
-		block = check_unallocated_block(pi->direct_data_blocks + block,
-			sb, create);
-	else {
-		if (pi->indirect_data_block == U16_MAX) {
-			// pr_info("[pitix_get_block]: aloc bloc pt indirectari");
-			idx = pitix_alloc_block(sb);
-			if (idx < 0)
-				return idx;
+	if (create)
+		--psb->bfree;
 
-			pi->indirect_data_block = idx;
-			new_indir = true;
-		}
+	if (block < INODE_DIRECT_DATA_BLOCKS) {
+		block = pi->direct_data_blocks[block];
+	} else {
+		if (block == INODE_DIRECT_DATA_BLOCKS)
+			--psb->bfree;
 
 		indir_bh = sb_bread(sb, dzone_block + pi->indirect_data_block);
 		if (!indir_bh)
 			return -ENOMEM;
 
-		idx = block - INODE_DIRECT_DATA_BLOCKS;
-		indirect_block = (__u16 *)indir_bh->b_data;
-		if (new_indir)
-			memset(indirect_block, U8_MAX, sb->s_blocksize);
+		block -= INODE_DIRECT_DATA_BLOCKS;
+		block = ((__u16 *)indir_bh->b_data)[block];
 
-		block = check_unallocated_block(indirect_block + idx, sb,
-			create);
-
-		mark_buffer_dirty(indir_bh);
 		brelse(indir_bh);
 	}
-
-	// pr_info("[pitix_get_block]: bloc final = %llu\n", block);
 
 	map_bh(bh_result, inode->i_sb, dzone_block + block);
 
@@ -93,13 +58,11 @@ int pitix_get_block(struct inode *inode, sector_t block,
 
 static int pitix_writepage(struct page *page, struct writeback_control *wbc)
 {
-	pr_info("[pitix_writepage]: scriu\n");
 	return block_write_full_page(page, pitix_get_block, wbc);
 }
 
 static int pitix_readpage(struct file *file, struct page *page)
 {
-	pr_info("[pitix_readpage]: citesc\n");
 	return block_read_full_page(page, pitix_get_block);
 }
 
@@ -108,19 +71,13 @@ pitix_write_begin(struct file *file, struct address_space *mapping, loff_t pos,
 		unsigned int len, unsigned int flags, struct page **pagep,
 		void **fsdata)
 {
-	// int ret;
-
 	return block_write_begin(mapping, pos, len, flags, pagep,
 		pitix_get_block);
-	// if (unlikely(ret))
-	// 	minix_write_failed(mapping, pos + len);
-
-	// return ret;
 }
 
 struct address_space_operations pitix_aops = {
 	.readpage = pitix_readpage,
 	.writepage = pitix_writepage,
 	.write_begin = pitix_write_begin,
-	.write_end = generic_write_end
+	.write_end = generic_write_end,
 };
