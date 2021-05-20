@@ -23,17 +23,19 @@
 int pitix_alloc_block(struct super_block *sb)
 {
 	struct pitix_super_block *psb = pitix_sb(sb);
+	long max_blocks = get_blocks(sb);
 	int idx;
 
-	if (!(psb->dmap_bh = sb_bread(sb, psb->dmap_block))) {
+	psb->dmap_bh = sb_bread(sb, psb->dmap_block);
+	if (!psb->dmap_bh) {
 		pr_err("unable to read DMAP\n");
 		return -ENOMEM;
 	}
 
 	psb->dmap = psb->dmap_bh->b_data;
-	idx = find_first_zero_bit((ulong *)psb->dmap, get_blocks(sb));
+	idx = find_first_zero_bit((ulong *)psb->dmap, max_blocks);
 
-	if (idx == get_blocks(sb)) {
+	if (idx == max_blocks) {
 		pr_err("DMAP full\n");
 		return -ENOSPC;
 	}
@@ -57,17 +59,19 @@ void pitix_free_block(struct super_block *sb, int block)
 int pitix_alloc_inode(struct super_block *sb)
 {
 	struct pitix_super_block *psb = pitix_sb(sb);
+	long max_inodes = get_inodes(sb);
 	int idx;
 
-	if (!(psb->imap_bh = sb_bread(sb, psb->imap_block))) {
+	psb->imap_bh = sb_bread(sb, psb->imap_block);
+	if (!psb->imap_bh) {
 		pr_err("unable to read IMAP\n");
 		return -ENOMEM;
 	}
 
 	psb->imap = psb->imap_bh->b_data;
-	idx = find_first_zero_bit((ulong *)psb->imap, get_inodes(sb));
+	idx = find_first_zero_bit((ulong *)psb->imap, max_inodes);
 
-	if (idx == get_inodes(sb)) {
+	if (idx == max_inodes) {
 		pr_err("IMAP full\n");
 		return -ENOSPC;
 	}

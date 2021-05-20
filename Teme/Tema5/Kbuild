@@ -1,6 +1,8 @@
 EXTRA_CFLAGS = -Wall -Wno-unused-function -g
 obj-m = pitix.o
+
 pitix-y = aops.o
 pitix-y += file_dir.o
+pitix-y += bitmap.o
 pitix-y += inode.o
 pitix-y += mount.o
