@@ -20,29 +20,71 @@
 #include "pitix_info.h"
 
 
+static sector_t
+check_unallocated_block(__u16 *initial_blp, struct super_block *sb, bool create)
+{
+	__u16 block = *initial_blp;
+
+	if (block != U16_MAX)
+		return block;
+
+	if (!create)
+		return -EIO;
+
+	block = pitix_alloc_block(sb);
+	*initial_blp = block;
+	return block;
+}
+
 int pitix_get_block(struct inode *inode, sector_t block,
 		struct buffer_head *bh_result, int create)
 {
 	struct pitix_inode *pi = pitix_i(inode);
 	struct super_block *sb = inode->i_sb;
-	__u8 dzone_block = pitix_sb(sb)->dzone_block;
+	struct pitix_super_block *psb = pitix_sb(sb);
+	__u8 dzone_block = psb->dzone_block;
+	__u16 *indirect_block;
 	struct buffer_head *indir_bh;
+	int idx;
+	bool new_indir = false;
+
+	// pr_info("[pitix_get_block]: ino = %lu; bl = %llu; create = %d\n",
+	// 	inode->i_ino, block, create);
 
 	if (block >= get_blocks(sb))
 		return -EINVAL;
 
 	if (block < INODE_DIRECT_DATA_BLOCKS)
-		block = pi->direct_data_blocks[block];
+		block = check_unallocated_block(pi->direct_data_blocks + block,
+			sb, create);
 	else {
+		if (pi->indirect_data_block == U16_MAX) {
+			// pr_info("[pitix_get_block]: aloc bloc pt indirectari");
+			idx = pitix_alloc_block(sb);
+			if (idx < 0)
+				return idx;
+
+			pi->indirect_data_block = idx;
+			new_indir = true;
+		}
+
 		indir_bh = sb_bread(sb, dzone_block + pi->indirect_data_block);
 		if (!indir_bh)
 			return -ENOMEM;
 
-		block -= INODE_DIRECT_DATA_BLOCKS;
-		block = ((__u16 *)indir_bh->b_data)[block];
+		idx = block - INODE_DIRECT_DATA_BLOCKS;
+		indirect_block = (__u16 *)indir_bh->b_data;
+		if (new_indir)
+			memset(indirect_block, U8_MAX, sb->s_blocksize);
 
+		block = check_unallocated_block(indirect_block + idx, sb,
+			create);
+
+		mark_buffer_dirty(indir_bh);
 		brelse(indir_bh);
 	}
+
+	// pr_info("[pitix_get_block]: bloc final = %llu\n", block);
 
 	map_bh(bh_result, inode->i_sb, dzone_block + block);
 
@@ -51,11 +93,13 @@ int pitix_get_block(struct inode *inode, sector_t block,
 
 static int pitix_writepage(struct page *page, struct writeback_control *wbc)
 {
+	pr_info("[pitix_writepage]: scriu\n");
 	return block_write_full_page(page, pitix_get_block, wbc);
 }
 
 static int pitix_readpage(struct file *file, struct page *page)
 {
+	pr_info("[pitix_readpage]: citesc\n");
 	return block_read_full_page(page, pitix_get_block);
 }
 
@@ -78,5 +122,5 @@ struct address_space_operations pitix_aops = {
 	.readpage = pitix_readpage,
 	.writepage = pitix_writepage,
 	.write_begin = pitix_write_begin,
-	.write_end = generic_write_end,
+	.write_end = generic_write_end
 };

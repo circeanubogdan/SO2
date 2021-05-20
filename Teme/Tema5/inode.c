@@ -23,6 +23,16 @@
 static void pitix_put_super(struct super_block *sb)
 {
 	struct pitix_super_block *psb = sb->s_fs_info;
+	struct pitix_super_block *aux = (struct pitix_super_block *)psb->sb_bh->b_data;
+
+	psb->sb_bh = sb_bread(sb, PITIX_SUPER_BLOCK);
+
+	pr_info("[pitix_put_super]: mag = %lu; v = %hhu; bs = %hhu; imap = %hhu; dmap = %hhu; izone = %hhu; dzone = %hhu; bfree = %hu; ffree = %hu;\n",
+		psb->magic, psb->version, psb->block_size_bits, psb->imap_block,
+		psb->dmap_block, psb->izone_block, psb->dzone_block, aux->bfree,
+		aux->ffree);
+
+	memcpy(psb->sb_bh->b_data, psb, sizeof(*psb));
 
 	mark_buffer_dirty(psb->sb_bh);
 	mark_buffer_dirty(psb->dmap_bh);
@@ -45,10 +55,11 @@ static struct inode *pitix_allocate_inode(struct super_block *s)
 	return inode;
 }
 
-static void pitix_destroy_inode(struct inode *inode)
+void pitix_evict_inode(struct inode *inode)
 {
 	// TODO: repara iput + kfree(pi)
 	// TODO: elibereaza din imap
+	mark_inode_dirty(inode);
 	kfree(inode);
 }
 
@@ -95,7 +106,7 @@ static const struct super_operations pitix_ops = {
 	.statfs = pitix_statfs,
 	.put_super = pitix_put_super,
 	.alloc_inode = pitix_allocate_inode,
-	.destroy_inode = pitix_destroy_inode,
+	.destroy_inode = pitix_evict_inode,
 	.write_inode = pitix_write_inode,
 };
 
@@ -163,15 +174,18 @@ struct inode *pitix_iget(struct super_block *s, ino_t ino)
 
 int pitix_fill_super(struct super_block *s, void *data, int silent)
 {
-	struct pitix_super_block *psb, *disk_psb;
+	struct pitix_super_block *psb = pitix_sb(s);
 	struct inode *root_inode;
 	struct dentry *root_dentry;
 	struct buffer_head *bh;
 	int ret = -EINVAL;
 
-	if (!(psb = kzalloc(sizeof(*psb), GFP_KERNEL)))
-		return -ENOMEM;
-	s->s_fs_info = psb;
+	pr_info("[pitix_fill_super]\n");
+	if (psb) {
+		brelse(psb->sb_bh);
+		brelse(psb->imap_bh);
+		brelse(psb->dmap_bh);
+	}
 
 	if (!sb_set_blocksize(s, PITIX_SUPER_BLOCK_SIZE))
 		goto out_kfree_psb;
@@ -179,32 +193,36 @@ int pitix_fill_super(struct super_block *s, void *data, int silent)
 	if (!(bh = sb_bread(s, PITIX_SUPER_BLOCK)))
 		goto out_kfree_psb;
 
-	disk_psb = (struct pitix_super_block *)bh->b_data;
-	if (disk_psb->magic != PITIX_MAGIC
-			|| disk_psb->version != PITIX_VERSION
-			|| !disk_psb->imap_block || !disk_psb->dmap_block)
-		goto out_brelease_bh;
+	psb = (struct pitix_super_block *)bh->b_data;
+	pr_info("[pitix_fill_super]: mag = %lu; v = %hhu; bs = %hhu; imap = %hhu; dmap = %hhu; izone = %hhu; dzone = %hhu; bfree = %hu; ffree = %hu;\n",
+		psb->magic, psb->version, psb->block_size_bits, psb->imap_block,
+		psb->dmap_block, psb->izone_block, psb->dzone_block, psb->bfree,
+		psb->ffree);
 
-	memcpy(psb, disk_psb, sizeof(*psb));
+	if (psb->magic != PITIX_MAGIC
+			|| psb->version != PITIX_VERSION
+			|| !psb->imap_block || !psb->dmap_block)
+		goto out_brelease_bh;
 
 	if (!sb_set_blocksize(s, POW2(psb->block_size_bits)))
 		goto out_brelease_bh;
 
 	s->s_magic = psb->magic;
 	s->s_op = &pitix_ops;
-
+	s->s_fs_info = psb;
 	psb->sb_bh = bh;
-	if(!(psb->imap_bh = sb_bread(s, psb->imap_block))) {
-		pr_err("failed to read imap block");
-		goto out_brelease_bh;
-	}
-	psb->imap = psb->imap_bh->b_data;
 
-	if(!(psb->dmap_bh = sb_bread(s, psb->dmap_block))) {
-		pr_err("failed to read dmap block");
-		goto out_brelease_imap_bh;
-	}
-	psb->dmap = psb->dmap_bh->b_data;
+	// if(!(psb->imap_bh = sb_bread(s, psb->imap_block))) {
+	// 	pr_err("failed to read imap block");
+	// 	goto out_brelease_bh;
+	// }
+	// psb->imap = psb->imap_bh->b_data;
+
+	// if(!(psb->dmap_bh = sb_bread(s, psb->dmap_block))) {
+	// 	pr_err("failed to read dmap block");
+	// 	goto out_brelease_imap_bh;
+	// }
+	// psb->dmap = psb->dmap_bh->b_data;
 
 	root_inode = pitix_iget(s, PITIX_ROOT_INODE_OFFSET);
 	if (!root_inode)
@@ -234,30 +252,22 @@ out_kfree_psb:
 
 struct inode *pitix_new_inode(struct super_block *sb)
 {
-	struct pitix_super_block *psb = pitix_sb(sb);
-	struct inode *inode = NULL;
+	struct inode *inode;
 	struct pitix_inode *pi;
-	ulong idx;
+	struct buffer_head *bh;
+	struct pitix_super_block *psb = pitix_sb(sb);
+	int idx = pitix_alloc_inode(sb);
+	int inodes_per_block = pitix_inodes_per_block(sb);
+	
+	if (idx == -ENOSPC)
+		return NULL;
 
-	psb->imap_bh = sb_bread(sb, psb->imap_block);
-	if (!psb->imap_bh) {
-		pr_err("failed to read IMAP block\n");
+	if (!(bh = sb_bread(sb, psb->izone_block + idx / inodes_per_block))) {
+		pr_err("failed to read izone block %d\n", idx);
+		// TODO: pune la loc bitul idx in imap
 		return NULL;
 	}
-	psb->imap = psb->imap_bh->b_data;
-	
-	idx = find_first_zero_bit((ulong *)psb->imap, sb->s_blocksize);
-	if (idx == sb->s_blocksize) {
-		pr_err("IMAP full\n");
-		goto out_brelse;
-	}
-
-	if (!(pi = kzalloc(sizeof(*pi), GFP_KERNEL)))
-		goto out_brelse;
-
-	__test_and_set_bit(idx, (ulong *)psb->imap);
-	mark_buffer_dirty(psb->imap_bh);
-	--psb->ffree;
+	pi = (struct pitix_inode *)bh->b_data + idx % inodes_per_block;
 
 	inode = new_inode(sb);
 	inode->i_uid = current_fsuid();
@@ -271,7 +281,8 @@ struct inode *pitix_new_inode(struct super_block *sb)
 	init_pitix_info(pi, inode);
 	insert_inode_hash(inode);
 
-out_brelse:
-	brelse(psb->imap_bh);
+	mark_buffer_dirty(bh);
+	brelse(bh);
+
 	return inode;
 }

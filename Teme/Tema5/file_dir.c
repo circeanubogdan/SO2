@@ -104,22 +104,27 @@ static int pitix_add_link(struct dentry *dentry, struct inode *inode)
 	struct buffer_head *dir_bh;
 	struct inode *dir = dentry->d_parent->d_inode;
 	struct super_block *sb = dir->i_sb;
-	struct pitix_inode *pi = pitix_i(inode);
+	struct pitix_inode *pi_dir = pitix_i(dir);
 	struct pitix_dir_entry *pde = NULL;
 	int i, ret = 0, max_entries = dir_entries_per_block(sb);
 
-	if (!(dir_bh = sb_bread(sb, pi->direct_data_blocks[0]))) {
+	// pr_info("[pitix_add_link]: name = %s; parent name = %s\n",
+	// 	dentry->d_name.name, dentry->d_parent->d_name.name);
+
+	if (!(dir_bh = sb_bread(sb, pi_dir->direct_data_blocks[0]))) {
 		pr_err("failed to read directoty block\n");
 		return -ENOMEM;
 	}
 
 	for (i = 0; i != max_entries; ++i) {
 		pde = (struct pitix_dir_entry *)dir_bh->b_data + i;
+		// pr_info("[pitix_add_link]: inode = %u; name = %s\n",
+			// pde->ino, pde->name);
 		if (!pde->ino)
 			break;
 	}
 
-	if (!pde) {
+	if (i == max_entries) {
 		ret = -ENOSPC;
 		pr_err("directory full\n");
 		goto out_brelse;
@@ -129,6 +134,8 @@ static int pitix_add_link(struct dentry *dentry, struct inode *inode)
 	memcpy(pde->name, dentry->d_name.name, PITIX_NAME_LEN);
 	dir->i_mtime = dir->i_ctime = current_time(inode);
 
+	// pr_info("[pitix_add_link]: ino = %u; name = %s\n", pde->ino, pde->name);
+
 	mark_buffer_dirty(dir_bh);
 
 out_brelse:
@@ -136,14 +143,36 @@ out_brelse:
 	return ret;
 }
 
+static void init_reg_inode(struct inode *inode)
+{
+	inode->i_op = &pitix_file_inode_operations;
+	inode->i_fop = &pitix_file_operations;
+}
+
+static int init_dir_inode(struct inode *inode, struct super_block *sb)
+{
+	struct pitix_inode *pi = pitix_i(inode);
+	ulong idx = pitix_alloc_block(sb);
+
+	if (idx == -ENOSPC)
+		return idx;
+
+	inode->i_op = &pitix_dir_inode_operations;
+	inode->i_fop = &pitix_dir_operations;
+	inode->i_size = sb->s_blocksize;
+
+	pi->direct_data_blocks[0] = idx;
+
+	return 0;
+}
+
 static int
 pitix_create(struct inode *dir, struct dentry *dentry, umode_t mode, bool excl)
 {
 	struct super_block *sb = dir->i_sb;
-	struct pitix_super_block *psb = pitix_sb(sb);
-	struct pitix_inode *pi_dir = pitix_i(dir);
+	// struct pitix_super_block *psb = pitix_sb(sb);
+	// struct pitix_inode *pi_dir = pitix_i(dir);
 	struct inode *inode;
-	struct pitix_inode *pi;
 	// int max_dentries = dir_entries_per_block(sb);
 	int ret;
 
@@ -155,40 +184,30 @@ pitix_create(struct inode *dir, struct dentry *dentry, umode_t mode, bool excl)
 		return -ENOMEM;
 	}
 
-	if (!(pi = kzalloc(sizeof(*pi), GFP_KERNEL)))
-		goto out_iput;
-
-	if (S_ISREG(mode)) {
-		inode->i_op = &pitix_file_inode_operations;
-		inode->i_fop = &pitix_file_operations;
-	} else if (S_ISDIR(mode)) {
-		inode->i_op = &pitix_dir_inode_operations;
-		inode->i_fop = &pitix_dir_operations;
-		inode->i_size = sb->s_blocksize;
-	}
-	inode->i_mapping->a_ops = &pitix_aops;
-
-	inode->i_mode = mode;
-	inode->i_private = pi;
-	init_pitix_info(pi, inode);
-
 	ret = pitix_add_link(dentry, inode);
 	if (ret) {
 		pr_err("failed to add inode %lu to dentry %s",
 			inode->i_ino, dentry->d_name.name);
-		goto out_kfree;
+		goto out_iput;
 	}
+
+	if (S_ISREG(mode)) {
+		init_reg_inode(inode);
+	} else if (S_ISDIR(mode)) {
+		if ((ret = init_dir_inode(inode, sb)))
+			goto out_iput;
+	}
+	inode->i_mapping->a_ops = &pitix_aops;
+
+	inode->i_mode = mode;
 
 	d_instantiate(dentry, inode);
 	mark_inode_dirty(inode);
 
-	--psb->bfree;
-
 	return 0;
 
-out_kfree:
-	kfree(pi);
 out_iput:
+	pitix_free_inode(sb, inode->i_ino);
 	iput(inode);
 	return ret;
 }
@@ -196,6 +215,11 @@ out_iput:
 static int pitix_mkdir(struct inode * dir, struct dentry * dentry, umode_t mode)
 {
 	return pitix_create(dir, dentry, mode | S_IFDIR, false);
+}
+
+void pitix_truncate(struct inode *inode)
+{
+	// TODO
 }
 
 struct file_operations pitix_dir_operations = {
