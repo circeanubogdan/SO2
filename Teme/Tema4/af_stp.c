@@ -21,13 +21,15 @@
 #include "stp.h"
 
 
+#define MAC_BYTES	6
 #define STP_HT_BITS	4
-#define NO_IF		-1
 
 
 struct sock_stats {
-	__be16 port;
+	__be16 src_port;
+	__be16 dst_port;
 	int idx;
+	__u8 mac[MAC_BYTES];
 	struct socket *sock;
 	struct hlist_node node;
 };
@@ -131,7 +133,7 @@ static bool find_port_if(__be16 port, int idx)
 	struct sock_stats *stat;
 
 	hash_for_each_rcu(binds, bkt, stat, node)
-		if (stat->port == port
+		if (stat->src_port == port
 				&& (stat->idx == idx || !stat->idx || !idx))
 			return true;
 	return false;
@@ -145,7 +147,7 @@ create_stats(struct sockaddr_stp *addr, struct socket *sock)
 	if (!sk_stats)
 		return NULL;
 
-	sk_stats->port = addr->sas_port;
+	sk_stats->src_port = addr->sas_port;
 	sk_stats->idx = addr->sas_ifindex;
 	sk_stats->sock = sock;
 
@@ -163,7 +165,7 @@ stp_bind(struct socket *sock, struct sockaddr *saddr, int sockaddr_len)
 	struct sockaddr_stp *addr = (struct sockaddr_stp *)saddr;
 	struct sock_stats *sk_stats;
 
-	pr_info("fam = %hhu; if = %d; port = %hu; MAC = %hhX:%hhX:%hhX:%hhX:%hhX:%hhX\n",
+	pr_info("[stp_bind]: fam = %hhu; if = %d; port = %hu; MAC = %hhX:%hhX:%hhX:%hhX:%hhX:%hhX\n",
 		addr->sas_family, addr->sas_ifindex, ntohs(addr->sas_port),
 		addr->sas_addr[0], addr->sas_addr[1], addr->sas_addr[2],
 		addr->sas_addr[3], addr->sas_addr[4], addr->sas_addr[5]);
@@ -196,18 +198,56 @@ stp_bind(struct socket *sock, struct sockaddr *saddr, int sockaddr_len)
 static int stp_connect(struct socket *sock, struct sockaddr *vaddr,
 	int sockaddr_len, int flags)
 {
+	struct sock *sk = sock->sk;
+	struct sock_stats *sk_stats = (struct sock_stats *)sk->sk_user_data;
+	struct sockaddr_stp *addr = (struct sockaddr_stp *)vaddr;
+
+	pr_info("[stp_connect]: if = %d; port = %hu\n",
+		sk_stats->idx, ntohs(sk_stats->src_port));
+
+	if (addr->sas_family != AF_STP || !addr->sas_port)
+		return -EINVAL;
+
+	sk_stats->dst_port = addr->sas_port;
+	memcpy(sk_stats->mac, addr->sas_addr, sizeof(sk_stats->mac));
+	sock->state = SS_CONNECTED;
+
 	return 0;
 }
 
 static int stp_sendmsg(struct socket *sock, struct msghdr *m, size_t total_len)
 {
+	struct sock *sk = sock->sk;
+	struct sock_stats *sk_stats = (struct sock_stats *)sk->sk_user_data;
+
+	pr_info("[stp_sendmsg]: src = %hu; dst = %hu; if = %d; MAC = %hhX:%hhX:%hhX:%hhX:%hhX:%hhX\n",
+		ntohs(sk_stats->src_port), ntohs(sk_stats->dst_port), sk_stats->idx,
+		sk_stats->mac[0], sk_stats->mac[1], sk_stats->mac[2],
+		sk_stats->mac[3], sk_stats->mac[4], sk_stats->mac[5]);
+
+	++stats.tx_pkts;
+	
 	return total_len;
 }
 
 static int
 stp_recvmsg(struct socket *sock, struct msghdr *m, size_t total_len, int flags)
 {
-	return 0;
+	++stats.rx_pkts;
+
+	return total_len;
+}
+
+static int stp_recv(struct sk_buff *skb, struct net_device *dev,
+	struct packet_type *pt, struct net_device *orig_dev)
+{
+	struct stp_hdr *hdr = (struct stp_hdr *)skb->data;
+
+	pr_info("[stp_recv]: dst = %hu; src = %hu; len = %hu; flags = %hhX; csum = %hhX\n",
+		hdr->dst, hdr->src, hdr->len, hdr->flags, hdr->csum);
+
+	consume_skb(skb);
+	return NET_RX_SUCCESS;
 }
 
 static const struct proto_ops stp_ops = {
@@ -232,10 +272,9 @@ static const struct proto_ops stp_ops = {
 };
 
 static struct proto stp_proto = {
-	.name		= STP_PROTO_NAME,
-	.owner		= THIS_MODULE,
-	// TODO: ce size?
-	.obj_size	= sizeof(struct aux_sock),
+	.name = STP_PROTO_NAME,
+	.owner = THIS_MODULE,
+	.obj_size = sizeof(struct aux_sock)  // TODO: ce size?
 };
 
 static int
@@ -265,7 +304,6 @@ stp_create_socket(struct net *net, struct socket *sock, int protocol, int kern)
 	sock->ops = &stp_ops;
 	sock->state = SS_UNCONNECTED;
 
-	// TODO: Do the protocol specific socket object initialization
 	return 0;
 };
 
@@ -276,9 +314,11 @@ static const struct net_proto_family stp_family = {
 };
 
 
-// TODO: cf?
-static struct packet_type stp_packet_type;
-
+// TODO: degeaba. pare ca nu se apeleaza stp_recv...
+static struct packet_type stp_packet_type = {
+	.type = ETH_P_STP,
+	.func = stp_recv
+};
 
 static int __init stp_init(void)
 {
