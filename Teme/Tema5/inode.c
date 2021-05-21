@@ -120,7 +120,8 @@ read_inode_from_disk(struct super_block *sb, ino_t ino,
 	long inodes_per_block = pitix_inodes_per_block(sb);
 	sector_t block = psb->izone_block + ino / inodes_per_block;
 
-	if (!(*bhp = sb_bread(sb, block))) {
+	*bhp = sb_bread(sb, block);
+	if (!*bhp) {
 		pr_err("sb_bread failed for inode block %lu\n", ino);
 		return NULL;
 	}
@@ -154,7 +155,7 @@ struct inode *pitix_iget(struct super_block *sb, ino_t ino)
 	inode->i_sb = sb;
 	inode->i_mode = pi->mode;
 	inode->i_size = pi->size;
-	inode->i_mtime = inode->i_atime= inode->i_ctime = current_time(inode);
+	inode->i_mtime = inode->i_atime = inode->i_ctime = current_time(inode);
 	i_uid_write(inode, pi->uid);
 	i_gid_write(inode, pi->gid);
 	inode->i_blocks = 0;
@@ -250,7 +251,7 @@ struct inode *pitix_new_inode(struct super_block *sb)
 	struct inode *inode;
 	struct pitix_inode *pi;
 	int idx = pitix_alloc_inode(sb);
-	
+
 	if (idx == -ENOSPC)
 		return NULL;
 

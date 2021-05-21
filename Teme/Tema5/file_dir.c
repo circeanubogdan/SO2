@@ -136,7 +136,7 @@ static int pitix_add_link(struct dentry *dentry, struct inode *inode)
 		ret = -ENOSPC;
 		pr_err("directory full\n");
 		goto out_brelse;
-	}	
+	}
 
 	pde->ino = inode->i_ino;
 	memcpy(pde->name, dentry->d_name.name, sizeof(pde->name));
@@ -176,10 +176,10 @@ static int
 pitix_create(struct inode *dir, struct dentry *dentry, umode_t mode, bool excl)
 {
 	struct super_block *sb = dir->i_sb;
-	struct inode *inode;
+	struct inode *inode = pitix_new_inode(sb);
 	int ret;
 
-	if (!(inode = pitix_new_inode(sb))) {
+	if (!inode) {
 		pr_err("error allocationg new inode\n");
 		return -ENOMEM;
 	}
@@ -213,7 +213,7 @@ out_iput:
 	return ret;
 }
 
-static int pitix_mkdir(struct inode * dir, struct dentry * dentry, umode_t mode)
+static int pitix_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
 {
 	return pitix_create(dir, dentry, mode | S_IFDIR, false);
 }

@@ -42,7 +42,6 @@ int pitix_alloc_block(struct super_block *sb)
 
 	__test_and_set_bit(idx, (ulong *)psb->dmap);
 	mark_buffer_dirty(psb->dmap_bh);
-	// brelse(psb->dmap_bh);
 	--psb->bfree;
 
 	return idx;
@@ -51,9 +50,8 @@ int pitix_alloc_block(struct super_block *sb)
 void pitix_free_block(struct super_block *sb, int block)
 {
 	struct pitix_super_block *psb = pitix_sb(sb);
-	
+
 	++psb->bfree;
-	// TODO
 }
 
 int pitix_alloc_inode(struct super_block *sb)
@@ -78,7 +76,6 @@ int pitix_alloc_inode(struct super_block *sb)
 
 	__test_and_set_bit(idx, (ulong *)psb->imap);
 	mark_buffer_dirty(psb->imap_bh);
-	// brelse(psb->dmap_bh);
 	--psb->ffree;
 
 	return idx;
@@ -87,7 +84,6 @@ int pitix_alloc_inode(struct super_block *sb)
 void pitix_free_inode(struct super_block *sb, int ino)
 {
 	struct pitix_super_block *psb = pitix_sb(sb);
-	
+
 	++psb->ffree;
-	// TODO
 }
