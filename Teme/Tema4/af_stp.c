@@ -20,6 +20,18 @@
 
 #include "stp.h"
 
+
+#define STP_HT_BITS	4
+#define NO_IF		-1
+
+
+struct sock_stats {
+	__be16 port;
+	int idx;
+	struct socket *sock;
+	struct hlist_node node;
+};
+
 // TODO: ce ne trebuie?
 struct aux_sock {
 	struct sock sk;
@@ -35,6 +47,9 @@ static struct stp_stats {
 } stats;
 
 static struct proc_dir_entry *proc_stp;
+
+static DEFINE_HASHTABLE(binds, STP_HT_BITS);
+static spinlock_t locks[1 << STP_HT_BITS];
 
 
 static int stp_proc_show(struct seq_file *m, void *v)
@@ -65,6 +80,32 @@ static const struct proc_ops r_pops = {
 	.proc_release	= single_release,
 };
 
+
+static struct sock_stats *get_stats(struct socket *sock)
+{
+	struct sock_stats *sk_stats;
+
+	hash_for_each_possible_rcu_notrace(binds, sk_stats, node, (u32)sock)
+		if (sk_stats->sock == sock)
+			return sk_stats;
+	return NULL;
+}
+
+static void unbind_hash(struct socket *sock)
+{
+	struct sock_stats *sk_stats = get_stats(sock);
+
+	if (!sk_stats)
+		return;
+
+	spin_lock(locks + hash_min((u32)sock, HASH_BITS(locks)));
+	hash_del_rcu(&sk_stats->node);
+	spin_unlock(locks + hash_min((u32)sock, HASH_BITS(locks)));
+	synchronize_rcu();
+
+	kfree(sk_stats);
+}
+
 static int stp_release(struct socket *sock)
 {
 	struct sock *sk = sock->sk;
@@ -77,14 +118,55 @@ static int stp_release(struct socket *sock)
 	sock_put(sk);
 	sock->sk = NULL;
 
+	if (sock->state != SS_FREE && sock->state != SS_UNCONNECTED)
+		unbind_hash(sock);
+	sock->state = SS_FREE;
+
 	return 0;
 }
 
-static int stp_bind(struct socket *sock, struct sockaddr *saddr,
-		int sockaddr_len)
+static bool find_port_if(__be16 port, int idx)
+{
+	size_t bkt;
+	struct sock_stats *stat;
+
+	hash_for_each_rcu(binds, bkt, stat, node)
+		if (stat->port == port
+				&& (stat->idx == idx || !stat->idx || !idx))
+			return true;
+	return false;
+}
+
+static struct sock_stats *
+create_stats(struct sockaddr_stp *addr, struct socket *sock)
+{
+	struct sock_stats *sk_stats = kmalloc(sizeof(*sk_stats), GFP_KERNEL);
+
+	if (!sk_stats)
+		return NULL;
+
+	sk_stats->port = addr->sas_port;
+	sk_stats->idx = addr->sas_ifindex;
+	sk_stats->sock = sock;
+
+	spin_lock(locks + hash_min((u32)sock, HASH_BITS(locks)));
+	hash_add_rcu(binds, &sk_stats->node, (u32)sock);
+	spin_unlock(locks + hash_min((u32)sock, HASH_BITS(locks)));
+
+	return sk_stats;
+}
+
+static int
+stp_bind(struct socket *sock, struct sockaddr *saddr, int sockaddr_len)
 {
 	struct sock *sk = sock->sk;
 	struct sockaddr_stp *addr = (struct sockaddr_stp *)saddr;
+	struct sock_stats *sk_stats;
+
+	pr_info("fam = %hhu; if = %d; port = %hu; MAC = %hhX:%hhX:%hhX:%hhX:%hhX:%hhX\n",
+		addr->sas_family, addr->sas_ifindex, ntohs(addr->sas_port),
+		addr->sas_addr[0], addr->sas_addr[1], addr->sas_addr[2],
+		addr->sas_addr[3], addr->sas_addr[4], addr->sas_addr[5]);
 
 	if (sk->sk_prot->bind)
 		return sk->sk_prot->bind(sk, saddr, sockaddr_len);
@@ -95,11 +177,24 @@ static int stp_bind(struct socket *sock, struct sockaddr *saddr,
 	if (addr->sas_family != AF_STP || !addr->sas_port)
 		return -EAFNOSUPPORT;
 
+	if (sock->state != SS_FREE && sock->state != SS_UNCONNECTED)
+		return -EBUSY;
+
+	if (find_port_if(addr->sas_port, addr->sas_ifindex))
+		return -EBUSY;
+
+	sk_stats = create_stats(addr, sock);
+	if (!sk_stats)
+		return -ENOMEM;
+
+	sk->sk_user_data = sk_stats;
+	sock->state = SS_CONNECTING;
+
 	return 0;
 }
 
 static int stp_connect(struct socket *sock, struct sockaddr *vaddr,
-		int sockaddr_len, int flags)
+	int sockaddr_len, int flags)
 {
 	return 0;
 }
@@ -109,8 +204,8 @@ static int stp_sendmsg(struct socket *sock, struct msghdr *m, size_t total_len)
 	return total_len;
 }
 
-static int stp_recvmsg(struct socket *sock, struct msghdr *m, size_t total_len,
-		int flags)
+static int
+stp_recvmsg(struct socket *sock, struct msghdr *m, size_t total_len, int flags)
 {
 	return 0;
 }
@@ -143,8 +238,8 @@ static struct proto stp_proto = {
 	.obj_size	= sizeof(struct aux_sock),
 };
 
-static int stp_create_socket(struct net *net, struct socket *sock, int protocol,
-			int kern)
+static int
+stp_create_socket(struct net *net, struct socket *sock, int protocol, int kern)
 {
 	struct sock *sk;
 
@@ -152,7 +247,6 @@ static int stp_create_socket(struct net *net, struct socket *sock, int protocol,
 		pr_err("Invalid socket type %d\n", sock->type);
 		return -EINVAL;
 	}
-
 	if (protocol) {
 		pr_err("Invalid protocol %d\n", protocol);
 		return -EINVAL;
@@ -188,7 +282,10 @@ static struct packet_type stp_packet_type;
 
 static int __init stp_init(void)
 {
-	int err;
+	int i, err;
+
+	for (i = 0; i != ARRAY_SIZE(locks); ++i)
+		spin_lock_init(locks + i);
 
 	err = sock_register(&stp_family);
 	if (err)
