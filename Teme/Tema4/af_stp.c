@@ -25,12 +25,31 @@ struct aux_sock {
 	struct sock sk;
 };
 
+static struct stp_stats {
+	int rx_pkts;
+	int hdr_err;
+	int csum_err;
+	int no_sock;
+	int no_buffs;
+	int tx_pkts;
+} stats;
+
 static struct proc_dir_entry *proc_stp;
 
 
 static int stp_proc_show(struct seq_file *m, void *v)
 {
 	seq_puts(m, "RxPkts HdrErr CsumErr NoSock NoBuffs TxPkts\n");
+	seq_printf(
+		m,
+		"%d %d %d %d %d %d\n",
+		stats.rx_pkts,
+		stats.hdr_err,
+		stats.csum_err,
+		stats.no_sock,
+		stats.no_buffs,
+		stats.tx_pkts
+	);
 
 	return 0;
 }
@@ -48,12 +67,34 @@ static const struct proc_ops r_pops = {
 
 static int stp_release(struct socket *sock)
 {
+	struct sock *sk = sock->sk;
+
+	if (!sk) {
+		pr_err("Socket already released.\n");
+		return -EINVAL;
+	}
+
+	sock_put(sk);
+	sock->sk = NULL;
+
 	return 0;
 }
 
-static int stp_bind(struct socket *sock, struct sockaddr *myaddr,
+static int stp_bind(struct socket *sock, struct sockaddr *saddr,
 		int sockaddr_len)
 {
+	struct sock *sk = sock->sk;
+	struct sockaddr_stp *addr = (struct sockaddr_stp *)saddr;
+
+	if (sk->sk_prot->bind)
+		return sk->sk_prot->bind(sk, saddr, sockaddr_len);
+
+	if (sockaddr_len < sizeof(struct sockaddr_stp))
+		return -EINVAL;
+
+	if (addr->sas_family != AF_STP || !addr->sas_port)
+		return -EAFNOSUPPORT;
+
 	return 0;
 }
 
@@ -107,28 +148,43 @@ static int stp_create_socket(struct net *net, struct socket *sock, int protocol,
 {
 	struct sock *sk;
 
-	sk = sk_alloc(net, PF_STP, GFP_KERNEL, &stp_proto, kern);
+	if (sock->type != SOCK_DGRAM) {
+		pr_err("Invalid socket type %d\n", sock->type);
+		return -EINVAL;
+	}
+
+	if (protocol) {
+		pr_err("Invalid protocol %d\n", protocol);
+		return -EINVAL;
+	}
+
+	sk = sk_alloc(net, AF_STP, GFP_KERNEL, &stp_proto, kern);
 	if (!sk) {
-		pr_err("failed to allocate socket.\n");
+		pr_err("Failed to allocate socket.\n");
 		return -ENOMEM;
 	}
 
 	sock_init_data(sock, sk);
-	sk->sk_family = PF_STP;
+	sk->sk_family = AF_STP;
 	sk->sk_protocol = protocol;
 
 	sock->ops = &stp_ops;
 	sock->state = SS_UNCONNECTED;
 
-	/* Do the protocol specific socket object initialization */
+	// TODO: Do the protocol specific socket object initialization
 	return 0;
 };
 
 static const struct net_proto_family stp_family = {
-	.family = PF_STP,
+	.family = AF_STP,
 	.create = stp_create_socket,
 	.owner = THIS_MODULE,
 };
+
+
+// TODO: cf?
+static struct packet_type stp_packet_type;
+
 
 static int __init stp_init(void)
 {
@@ -138,26 +194,37 @@ static int __init stp_init(void)
 	if (err)
 		return err;
 
+	err = proto_register(&stp_proto, 0);
+	if (err < 0)
+		goto out_sock_unregister;
+
+	dev_add_pack(&stp_packet_type);
+
 	proc_stp = proc_create(
 		STP_PROC_NET_FILENAME,
 		0000,
 		init_net.proc_net,
 		&r_pops);
 	if (!proc_stp) {
+		pr_err("Failed to create proc entry.\n");
 		err = -EINVAL;
-		goto out_sock_unregister;
+		goto out_proto_unregister;
 	}
 
 	return 0;
 
+out_proto_unregister:
+	proto_unregister(&stp_proto);
 out_sock_unregister:
-	sock_unregister(PF_STP);
+	sock_unregister(AF_STP);
 	return err;
 }
 
 static void __exit stp_exit(void)
 {
 	proc_remove(proc_stp);
+	dev_remove_pack(&stp_packet_type);
+	proto_unregister(&stp_proto);
 	sock_unregister(AF_STP);
 }
 
