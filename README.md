@@ -68,6 +68,12 @@ Un subsistem misto si un lab la misto. Cumva similar cu tema 1, se intercepteaza
 trafic TCP si UDP (folosind `netfilter`).
 
 
+### Lab 11 - Linux pe ARM
+O mizerie facuta doar ca sa fie si pt ca NXP. Nu merita. Mai bine faceam
+networking mai ca lumea. Sau mai bine mai faceam un lab in care se explicau
+`bio`-urile.
+
+
 
 ## Teme
 ### Tema 0 - API-ul de liste din Kernel
@@ -111,6 +117,7 @@ iar bufferele interne sunt implementate folosind `kfifo`-uri.
 Destul de jegoasa. Multumiri speciale @[Adina](https://github.com/adinasm), care
 s-a ocupat de partea de registre si de frecat datasheetul.
 
+
 ### Tema 3 - RAID Software
 Se implementeaza schema de replicare *RAID 1* intre 2 discuri fizice. Fiecarui
 sector de 512 octeti dintr-un disc i se calculeaza un *CRC* care este scris
@@ -122,3 +129,16 @@ gresite, atunci se semnaleaza o eroare de *I/O* folosind `bio_io_error()`.
 
 Da, se folosesc `bio`-uri... :(. Foarte obscure structuri si prost documentate,
 atat in lab, cat si pe net.
+
+
+### Tema 4 - SO2 Transport Protocol
+Un protocol de transport mai dubios care functioneaza direct peste nivelul 2.
+Practic creeaza un nou tip de socket pe care se pot executa `send` si `recv` si
+care functioneaza cu datagrame, similar cu *UDP* (de altfel, headerul e foarte
+similar cu al *UDP*-ului).
+
+Tot mi s-a parut ca a fost mult prea mult de sapat de-a-n pulea pe
+[LXR](https://elixir.bootlin.com/linux/latest/source) pentru ca la
+[labul de networking](https://github.com/teodutu/SO2/tree/main/Laboratoare/Lab10)
+se face o pula. O tema nu trebuie sa presupuna sa cautam acul in carul cu fan.
+Ce e asta, [ML](https://github.com/teodutu/ML)?
