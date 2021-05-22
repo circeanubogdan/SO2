@@ -22,7 +22,7 @@
 
 
 #define MAC_BYTES	6
-#define STP_HT_BITS	4
+#define STP_HT_BITS	12
 
 
 struct stp_sock {
@@ -84,25 +84,45 @@ static inline struct stp_sock *stp_sk(struct socket *sock)
 	return (struct stp_sock *)sock->sk;
 }
 
-static void unbind_hash(struct socket *sock)
+static void unbind(struct stp_sock *sk)
 {
-	spin_lock(locks + hash_min((u32)sock, HASH_BITS(locks)));
-	hash_del_rcu(&stp_sk(sock)->node);
-	spin_unlock(locks + hash_min((u32)sock, HASH_BITS(locks)));
+	spin_lock(locks + hash_min(sk->dst_port, HASH_BITS(locks)));
+	hash_del_rcu(&sk->node);
+	spin_unlock(locks + hash_min(sk->dst_port, HASH_BITS(locks)));
 	synchronize_rcu();
 }
+
+static struct stp_sock *port_sk(__u16 port)
+{
+	struct stp_sock *sk;
+
+	hash_for_each_possible_rcu(binds, sk, node, port)
+		if (sk->src_port == port)
+			return sk;	
+	return NULL;
+}
+
+static bool find_port_if(__be16 port, int idx)
+{
+	struct stp_sock *stat;
+
+	hash_for_each_possible_rcu(binds, stat, node, port)
+		if (stat->src_port == port
+				&& (stat->idx == idx || !stat->idx || !idx))
+			return true;
+	return false;
+}
+
 
 static int stp_release(struct socket *sock)
 {
 	struct stp_sock *sk = stp_sk(sock);
 
-	if (!sk) {
-		pr_err("Socket already released.\n");
+	if (!sk)
 		return -EINVAL;
-	}
 
 	if (sock->state != SS_FREE && sock->state != SS_UNCONNECTED)
-		unbind_hash(sock);
+		unbind(sk);
 
 	sock->state = SS_FREE;
 	sock_put(&sk->sk);
@@ -111,19 +131,7 @@ static int stp_release(struct socket *sock)
 	return 0;
 }
 
-static bool find_port_if(__be16 port, int idx)
-{
-	size_t bkt;
-	struct stp_sock *stat;
-
-	hash_for_each_rcu(binds, bkt, stat, node)
-		if (stat->src_port == port
-				&& (stat->idx == idx || !stat->idx || !idx))
-			return true;
-	return false;
-}
-
-static void init_sk_sock(struct sockaddr_stp *addr, struct socket *sock)
+static void init_stp_sock(struct sockaddr_stp *addr, struct socket *sock)
 {
 	struct stp_sock *sk = (struct stp_sock *)sock->sk;
 
@@ -131,9 +139,9 @@ static void init_sk_sock(struct sockaddr_stp *addr, struct socket *sock)
 	sk->idx = addr->sas_ifindex;
 	sk->sock = sock;
 
-	spin_lock(locks + hash_min((u32)sock, HASH_BITS(locks)));
-	hash_add_rcu(binds, &sk->node, (u32)sock);
-	spin_unlock(locks + hash_min((u32)sock, HASH_BITS(locks)));
+	spin_lock(locks + hash_min(sk->src_port, HASH_BITS(locks)));
+	hash_add_rcu(binds, &sk->node, sk->src_port);
+	spin_unlock(locks + hash_min(sk->src_port, HASH_BITS(locks)));
 }
 
 static int
@@ -142,13 +150,10 @@ stp_bind(struct socket *sock, struct sockaddr *saddr, int sockaddr_len)
 	struct stp_sock *sk = stp_sk(sock);
 	struct sockaddr_stp *addr = (struct sockaddr_stp *)saddr;
 
-	pr_info("[%s]: if = %d; port = %hu\n", __func__,
-		addr->sas_ifindex, ntohs(addr->sas_port));
-
 	if (sk->sk.sk_prot->bind)
 		return sk->sk.sk_prot->bind(&sk->sk, saddr, sockaddr_len);
 
-	if (sockaddr_len < sizeof(struct sockaddr_stp))
+	if (sockaddr_len < sizeof(*addr))
 		return -EINVAL;
 
 	if (addr->sas_family != AF_STP || !addr->sas_port)
@@ -160,7 +165,7 @@ stp_bind(struct socket *sock, struct sockaddr *saddr, int sockaddr_len)
 	if (find_port_if(addr->sas_port, addr->sas_ifindex))
 		return -EBUSY;
 
-	init_sk_sock(addr, sock);
+	init_stp_sock(addr, sock);
 	sock->state = SS_CONNECTING;
 
 	return 0;
@@ -172,11 +177,6 @@ static int stp_connect(struct socket *sock, struct sockaddr *vaddr,
 	struct stp_sock *sk = stp_sk(sock);
 	struct sockaddr_stp *addr = (struct sockaddr_stp *)vaddr;
 
-	pr_info("[%s]: fam = %hhu; port = %hu; MAC = %hhX:%hhX:%hhX:%hhX:%hhX:%hhX\n",
-		__func__, addr->sas_family, ntohs(addr->sas_port),
-		addr->sas_addr[0], addr->sas_addr[1], addr->sas_addr[2],
-		addr->sas_addr[3], addr->sas_addr[4], addr->sas_addr[5]);
-
 	if (addr->sas_family != AF_STP || !addr->sas_port)
 		return -EINVAL;
 
@@ -187,47 +187,33 @@ static int stp_connect(struct socket *sock, struct sockaddr *vaddr,
 	return 0;
 }
 
-static void create_header(struct stp_hdr *hdr, struct stp_sock *sk, size_t len)
+static __u8 csum(struct sk_buff *skb)
 {
-	hdr->dst = sk->dst_port;
-	hdr->src = sk->src_port;
-	hdr->flags = 0;
-	hdr->len = htons(len + sizeof(*hdr));
+	char *p = skb_network_header(skb);
+	char *fin = p + skb->data_len;
+	__u8 cs = 0;
+
+	for (; p != fin; cs ^= *p++);
+
+	return cs;
 }
 
 static int stp_sendmsg(struct socket *sock, struct msghdr *m, size_t total_len)
 {
 	struct stp_sock *sk = stp_sk(sock);
+	struct sockaddr_stp *addr = (struct sockaddr_stp *)m->msg_name;
 	struct net_device *dev;
 	struct sk_buff *skb;
 	struct stp_hdr *hdr;
 	unsigned long hlen, tlen, dlen, offset;
 	int err;
 
-	struct sockaddr_stp *addr = (struct sockaddr_stp *)m->msg_name;
-	// pr_info("[stp_sendmsg m]: fam = %hhu; port = %hu; MAC = %hhX:%hhX:%hhX:%hhX:%hhX:%hhX\n",
-	// 	addr->sas_family, ntohs(addr->sas_port), addr->sas_addr[0],
-	// 	addr->sas_addr[1], addr->sas_addr[2], addr->sas_addr[3],
-	// 	addr->sas_addr[4], addr->sas_addr[5]);
-
-	pr_info("[%s]: src = %hu; dst = %hu; if = %d; MAC = %hhX:%hhX:%hhX:%hhX:%hhX:%hhX\n",
-		__func__, ntohs(sk->src_port), ntohs(sk->dst_port), sk->idx,
-		sk->mac[0], sk->mac[1], sk->mac[2], sk->mac[3], sk->mac[4],
-		sk->mac[5]);
-
-	if (!sk->idx) {
-		pr_err("Unable to send packet without an interface.\n");
+	if (!sk->idx)
 		return -EINVAL;
-	}
 
 	dev = dev_get_by_index(sock_net(&sk->sk), sk->idx);
-	if (!dev) {
-		pr_err("Failed to send obtain net device from index %d.\n",
-			sk->idx);
+	if (!dev)
 		return -EINVAL;
-	}
-
-	pr_info("[%s]: dev = %X\n", __func__, dev);
 
 	hlen = LL_RESERVED_SPACE(dev);
 	tlen = dev->needed_tailroom;
@@ -236,34 +222,25 @@ static int stp_sendmsg(struct socket *sock, struct msghdr *m, size_t total_len)
 	skb = sock_alloc_send_pskb(&sk->sk, hlen, dlen,
 		m->msg_flags & MSG_DONTWAIT, &err, 0);
 	// TODO: verifica err
-	if (!skb) {
-		pr_info("[%s]: skb = %X, err = %d\n", __func__, skb, err);
+	if (!skb)
 		goto out_unlock;
-	}
-
-	pr_info("[%s]: skb = %X, err = %d\n", __func__, skb, err);
 
 	skb_reserve(skb, hlen);
-	pr_info("[%s]: reserve skb = %X\n", __func__, skb);
 	skb_reset_network_header(skb);
-	pr_info("[%s]: reset skb = %X\n", __func__, skb);
 
 	// TODO: dlen in loc de total_len?
-	offset = dev_hard_header(skb, dev, ETH_P_STP, sk->dst_port ? sk->mac
-		: addr->sas_addr, NULL, total_len);
+	offset = dev_hard_header(skb, dev, ETH_P_STP,
+		sk->dst_port ? sk->mac : addr->sas_addr, NULL, total_len);
 	if (offset < 0) {
 		err = -EINVAL;
 		goto out_free;
 	}
-
-	pr_info("[%s]: offset = %d\n", __func__, offset);
 
 	skb->protocol = htons(ETH_P_STP);
 	skb->dev = dev;
 	skb->priority = sk->sk.sk_priority;
 
 	hdr = (struct stp_hdr *)skb_put(skb, dlen);
-	pr_info("[%s]: hdr = %X\n", __func__, hdr);
 	hdr->dst = sk->dst_port ? sk->dst_port : addr->sas_port;
 	hdr->src = sk->src_port;
 	hdr->len = total_len; // TODO: sau dlen?
@@ -278,12 +255,10 @@ static int stp_sendmsg(struct socket *sock, struct msghdr *m, size_t total_len)
 	if (err)
 		goto out_free;
 
-	pr_info("[%s]: copy ok\n", __func__);
+	hdr->csum = csum(skb);
 
-	dev_put(dev);
-	pr_info("[%s]: dev_put ok\n", __func__);
 	dev_queue_xmit(skb);
-	pr_info("[%s]: xmit skb = %X\n", __func__, skb);
+	dev_put(dev);
 
 	++stats.tx_pkts;
 
@@ -302,22 +277,26 @@ out_unlock:
 static int
 stp_recvmsg(struct socket *sock, struct msghdr *m, size_t total_len, int flags)
 {
-	// int err = 0;
 	struct stp_sock *sk = stp_sk(sock);
-	// struct sk_buff *skb;
+	struct sk_buff *skb;
+	struct stp_hdr *hdr;
+	size_t msg_len;
+	int err = 0;
 
-	pr_info("[%s]: src = %hu; dst = %hu; if = %d; MAC = %hhX:%hhX:%hhX:%hhX:%hhX:%hhX\n",
-		__func__, ntohs(sk->src_port), ntohs(sk->dst_port), sk->idx,
-		sk->mac[0], sk->mac[1], sk->mac[2], sk->mac[3], sk->mac[4],
-		sk->mac[5]);
+	skb = skb_recv_datagram(&sk->sk, flags, flags & MSG_DONTWAIT, &err);
+	if (!skb)
+		return err;
 
-	// do {
-	// 	skb = skb_recv_datagram(&sk->sk, flags,
-	// 		flags, &err);
-	// } while (err == -ERESTARTSYS);
-	// pr_info("[stp_recvmsg]: err = %d; skb = 0x%X\n", err, skb);
+	msg_len = skb->data_len - sizeof(*hdr);
+	msg_len = min_t(size_t, msg_len, total_len);
+	err = skb_copy_datagram_iter(skb, sizeof(*hdr), &m->msg_iter, msg_len);
+	if (err) {
+		kfree_skb(skb);
+		return err;
+	}
 
 	++stats.rx_pkts;
+	consume_skb(skb);
 
 	return total_len;
 }
@@ -326,13 +305,42 @@ static int stp_recv(struct sk_buff *skb, struct net_device *dev,
 	struct packet_type *pt, struct net_device *orig_dev)
 {
 	struct stp_hdr *hdr = (struct stp_hdr *)skb_network_header(skb);
+	struct stp_sock *sk;
+	__u8 recv_cs;
+	int ret;
 
-	pr_info("[%s]: src = %hu; dst = %hu; len = %hu; flags = %hhX; csum = %hhX\n",
-		__func__, ntohs(hdr->src), ntohs(hdr->dst), hdr->len,
-		hdr->flags, hdr->csum);
+	if (skb->data_len < sizeof(*hdr) || !hdr->src || !hdr->dst) {
+		++stats.hdr_err;
+		ret = -EINVAL;
+		goto out;
+	}
 
-	consume_skb(skb);
+	recv_cs = hdr->csum;
+	hdr->csum = 0;
+	if (recv_cs != csum(skb)) {
+		++stats.csum_err;
+		ret = -EINVAL;
+		goto out;
+	}
+
+	sk = port_sk(hdr->dst);
+	if (!sk) {
+		++stats.no_sock;
+		ret = -ENOTSOCK;
+		goto out;
+	}
+
+	ret = sock_queue_rcv_skb(&sk->sk, skb);
+	if (ret) {
+		++stats.no_buffs;
+		goto out;
+	}
+
 	return NET_RX_SUCCESS;
+
+out:
+	kfree_skb(skb);
+	return ret;
 }
 
 static const struct proto_ops stp_ops = {
@@ -365,27 +373,19 @@ stp_create_socket(struct net *net, struct socket *sock, int protocol, int kern)
 {
 	struct sock *sk;
 
-	if (sock->type != SOCK_DGRAM) {
-		pr_err("Invalid socket type %d\n", sock->type);
+	if (protocol != IPPROTO_IP || sock->type != SOCK_DGRAM)
 		return -EINVAL;
-	}
-	if (protocol) {
-		pr_err("Invalid protocol %d\n", protocol);
-		return -EINVAL;
-	}
 
 	sk = sk_alloc(net, AF_STP, GFP_KERNEL, &stp_proto, kern);
-	if (!sk) {
-		pr_err("Failed to allocate socket.\n");
+	if (!sk)
 		return -ENOMEM;
-	}
 
 	sock_init_data(sock, sk);
 	sk->sk_family = AF_STP;
 	sk->sk_protocol = protocol;
 
 	sock->ops = &stp_ops;
-	sock->state = SS_UNCONNECTED;
+	sock->state = SS_FREE;
 
 	return 0;
 };
@@ -435,13 +435,25 @@ out_sock_unregister:
 	return err;
 }
 
+static void remove_binds(void)
+{
+	struct stp_sock *sk;
+	struct hlist_node *tmp;
+	size_t bkt;
+
+	hash_for_each_safe(binds, bkt, tmp, sk, node) {
+		hash_del(&sk->node);
+		sk_free(&sk->sk);
+	}
+}
+
 static void __exit stp_exit(void)
 {
 	proc_remove(proc_stp);
 	dev_remove_pack(&stp_packet_type);
 	proto_unregister(&stp_proto);
 	sock_unregister(AF_STP);
-	// TODO: scoate din hashtable?
+	remove_binds();
 }
 
 module_init(stp_init);
