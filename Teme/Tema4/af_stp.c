@@ -98,7 +98,7 @@ static struct stp_sock *port_sk(__u16 port)
 
 	hash_for_each_possible_rcu(binds, sk, node, port)
 		if (sk->src_port == port)
-			return sk;	
+			return sk;
 	return NULL;
 }
 
@@ -193,7 +193,8 @@ static __u8 csum(struct sk_buff *skb)
 	char *fin = p + skb->data_len;
 	__u8 cs = 0;
 
-	for (; p != fin; cs ^= *p++);
+	for (; p != fin; cs ^= *p++)
+		;
 
 	return cs;
 }
@@ -205,7 +206,7 @@ static int stp_sendmsg(struct socket *sock, struct msghdr *m, size_t total_len)
 	struct net_device *dev;
 	struct sk_buff *skb;
 	struct stp_hdr *hdr;
-	unsigned long hlen, tlen, dlen, offset;
+	unsigned long hlen, dlen, offset;
 	int err;
 
 	if (!sk->idx)
@@ -216,39 +217,34 @@ static int stp_sendmsg(struct socket *sock, struct msghdr *m, size_t total_len)
 		return -EINVAL;
 
 	hlen = LL_RESERVED_SPACE(dev);
-	tlen = dev->needed_tailroom;
 	dlen = total_len + sizeof(*hdr);
-
 	skb = sock_alloc_send_pskb(&sk->sk, hlen, dlen,
 		m->msg_flags & MSG_DONTWAIT, &err, 0);
-	// TODO: verifica err
 	if (!skb)
 		goto out_unlock;
 
 	skb_reserve(skb, hlen);
 	skb_reset_network_header(skb);
 
-	// TODO: dlen in loc de total_len?
 	offset = dev_hard_header(skb, dev, ETH_P_STP,
-		sk->dst_port ? sk->mac : addr->sas_addr, NULL, total_len);
+		sk->dst_port ? sk->mac : addr->sas_addr, NULL, dlen);
 	if (offset < 0) {
 		err = -EINVAL;
 		goto out_free;
 	}
 
-	skb->protocol = htons(ETH_P_STP);
-	skb->dev = dev;
-	skb->priority = sk->sk.sk_priority;
-
 	hdr = (struct stp_hdr *)skb_put(skb, dlen);
 	hdr->dst = sk->dst_port ? sk->dst_port : addr->sas_port;
 	hdr->src = sk->src_port;
-	hdr->len = total_len; // TODO: sau dlen?
-	hdr->flags = 0;
+	hdr->len = dlen;
+	hdr->flags = m->msg_flags;
 	hdr->csum = 0;
 
 	skb->data_len = dlen;
 	skb->len += dlen;
+	skb->protocol = htons(ETH_P_STP);
+	skb->dev = dev;
+	skb->priority = sk->sk.sk_priority;
 
 	err = skb_copy_datagram_from_iter(skb, offset + sizeof(*hdr),
 		&m->msg_iter, total_len);
@@ -365,7 +361,7 @@ static const struct proto_ops stp_ops = {
 static struct proto stp_proto = {
 	.name = STP_PROTO_NAME,
 	.owner = THIS_MODULE,
-	.obj_size = sizeof(struct stp_sock)
+	.obj_size = sizeof(struct stp_sock),
 };
 
 static int
@@ -398,7 +394,7 @@ static const struct net_proto_family stp_family = {
 
 static struct packet_type stp_packet_type = {
 	.type = htons(ETH_P_STP),
-	.func = stp_recv
+	.func = stp_recv,
 };
 
 static int __init stp_init(void)
