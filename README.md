@@ -74,6 +74,11 @@ networking mai ca lumea. Sau mai bine mai faceam un lab in care se explicau
 `bio`-urile.
 
 
+### Lab 12 - Profiling
+Un cacat de rulat `perf` si alte utilitare similare ca sa inspectam module sau
+binare. Inca nu stiu cum se face ultimul exercitiu :(.
+
+
 
 ## Teme
 ### Tema 0 - API-ul de liste din Kernel
